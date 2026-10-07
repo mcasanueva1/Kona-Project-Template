@@ -1,6 +1,6 @@
 "use strict";
 
-const BUILD_ID = "kona library __20260925-183113-vlwn7rh__";
+const BUILD_ID = "kona library __20261007-142730-6kxg4h2__";
 console.log("%cBuild:", "color:#888", BUILD_ID);
 
 (function (global) {
@@ -237,7 +237,8 @@ const util = {
       if (tokens) {
         tokens.forEach((token) => {
           let schemaRelatedValue = util.getSchemaRelatedVar(token); //look for schemaRelatedVar
-          if (schemaRelatedValue) {
+          //"" is a value (as for string settings); null / undefined keep the token
+          if (schemaRelatedValue !== null && schemaRelatedValue !== undefined) {
             objectAsText = objectAsText.replace(`"${token}"`, JSON.stringify(schemaRelatedValue)); //replace
           }
         });
@@ -368,6 +369,678 @@ const util = {
 
     return { run };
   })(),
+};
+
+/**
+ * CRM Module
+ *
+ * Platform-neutral access to the CRM (Veeva CRM and Vault CRM). The rest of the framework uses
+ * neutral object / field / picklist names (camelCase); one driver per platform maps them to the
+ * platform's names, where-clause syntax and result keys. The driver is picked from
+ * project.jsLibrary: "veeva-library.js" (or empty) -> veeva, "vault-crm-library.js" -> vault.
+ * Both platforms load their library under the same namespace (com.veeva.clm).
+ *
+ * All methods return promises that resolve (never reject); failures are logged through util.log.
+ *
+ * @module crm
+ */
+
+const crm = {
+  /* STATE ------------------------------------------------*/
+  state: {
+    initialized: false,
+    platform: "veeva",
+    loggedOnce: {}, //messages logged once per page (unmapped names / values)
+    labelCache: {}, //picklist labels by "object.field"
+    queue: Promise.resolve(), //serializes library calls (see helpers.call)
+  },
+
+  /* CONSTANTS --------------------------------------------*/
+  constants: {
+    platformByLibrary: {
+      "": "veeva",
+      "veeva-library.js": "veeva",
+      "vault-crm-library.js": "vault",
+    },
+    maxWhereLength: 1000,
+    callTimeout: 15000,
+  },
+
+  /* DRIVERS ----------------------------------------------*/
+  /*
+    objects.<neutral object>:
+      name:    platform object name (queryRecord / createRecord)
+      current: object name for getDataForCurrentObject (Veeva keyword / Vault object name)
+      fields.<neutral field>: platform field name, or { name, values, key, label }
+        values: { <neutral value>: <platform value> } (picklists)
+        key:    true -> value normalized to a neutral key (account type)
+        label:  true -> value replaced by its picklist label (Vault picklists shown as text)
+  */
+  drivers: {
+    veeva: {
+      id: "veeva",
+      idField: "ID",
+      normalizeKey: (value) => String(value).replace(/_vod$/, "").replace(/_/g, "").toLowerCase(),
+      approvedDocumentId: (data) => (data.Approved_Document_vod__c ? data.Approved_Document_vod__c.ID : null),
+      //Veeva returns { value: label }
+      picklistLabelsMap: (raw) => raw || {},
+      objects: {
+        account: {
+          name: "Account",
+          current: "Account",
+          fields: { id: "ID", name: "Name", salutation: "Salutation", typeId: "RecordTypeId" },
+        },
+        accountType: {
+          name: "RecordType",
+          fields: {
+            id: "ID",
+            name: "Name",
+            key: { name: "DeveloperName", key: true },
+            objectName: { name: "SobjectType", values: { account: "Account" } },
+          },
+        },
+        call: {
+          name: "Call2_vod__c",
+          current: "Call",
+          fields: {
+            id: "ID",
+            accountId: "Account_vod__c",
+            channel: {
+              name: "Call_Channel_vod__c",
+              values: { faceToFace: "Face_to_face_vod", video: "Video_vod", phone: "Phone_vod", message: "Message_vod", email: "Email_vod", other: "Other_vod" },
+            },
+            datetime: "Call_Datetime_vod__c",
+            date: "Call_Date_vod__c",
+            status: { name: "Status_vod__c", values: { submitted: "Submitted_vod", planned: "Planned_vod", saved: "Saved_vod" } },
+          },
+        },
+        callKeyMessage: {
+          name: "Call2_Key_Message_vod__c",
+          fields: {
+            id: "ID",
+            accountId: "Account_vod__c",
+            callId: "Call2_vod__c",
+            callDate: "Call_Date_vod__c",
+            startTime: "Start_Time_vod__c",
+            keyMessageId: "Key_Message_vod__c",
+            duration: "Duration_vod__c",
+            reaction: { name: "Reaction_vod__c", values: { positive: "Positive", neutral: "Neutral", negative: "Negative" } },
+            displayOrder: "Display_Order_vod__c",
+            keyMessageName: "Key_Message_Name_vod__c",
+            presentationName: "Clm_Presentation_Name_vod__c",
+          },
+        },
+        keyMessage: {
+          name: "Key_Message_vod__c",
+          current: "KeyMessage",
+          fields: {
+            id: "ID",
+            name: "Name",
+            mediaFileName: "Media_File_Name_vod__c",
+            disableActions: "Disable_Actions_vod__c",
+            iosResolution: "iOS_Resolution_vod__c",
+            vaultDocId: "Vault_Doc_ID_vod__c",
+            status: { name: "Status_vod__c", values: { approved: "Approved_vod", staged: "Staged_vod", expired: "Expired_vod" } },
+            slideVersion: "Slide_Version_vod__c",
+            vaultExternalId: "Vault_External_Id_vod__c",
+          },
+        },
+        presentation: {
+          name: "Clm_Presentation_vod__c",
+          current: "Presentation",
+          fields: {
+            id: "ID",
+            name: "Name",
+            status: { name: "Status_vod__c", values: { approved: "Approved_vod", staged: "Staged_vod", expired: "Expired_vod" } },
+            vaultDocId: "Vault_Doc_ID_vod__c",
+            version: "Version_vod__c",
+            vaultExternalId: "Vault_External_Id_vod__c",
+          },
+        },
+        presentationSlide: {
+          name: "Clm_Presentation_Slide_vod__c",
+          fields: { id: "ID", keyMessageId: "Key_Message_vod__c", presentationId: "Clm_Presentation_vod__c", displayOrder: "Display_Order_vod__c" },
+        },
+        sentEmail: {
+          name: "Sent_Email_vod__c",
+          fields: {
+            id: "ID",
+            accountId: "Account_vod__c",
+            emailFragments: "Email_Fragments_vod__c",
+            emailTemplateId: "Approved_Email_Template_vod__c",
+            sentDate: "Email_Sent_Date_vod__c",
+            opened: "Opened_vod__c",
+            openCount: "Open_Count_vod__c",
+            lastOpenDate: "Last_Open_Date_vod__c",
+            clickCount: "Click_Count_vod__c",
+            lastActivityDate: "Last_Activity_Date_vod__c",
+            documentViews: "Approved_Document_Views_vod__c",
+            status: { name: "Status_vod__c", values: { sent: "Sent_vod", delivered: "Delivered_vod" } },
+          },
+        },
+        emailActivity: {
+          name: "Email_Activity_vod__c",
+          fields: {
+            id: "ID",
+            sentEmailId: "Sent_Email_vod__c",
+            approvedDocumentId: "Approved_Document_vod__c",
+            vaultDocId: "Vault_Doc_ID_vod__c",
+            vaultDocName: "Vault_Doc_Name_vod__c",
+            vaultDocumentNumber: "Vault_Document_Number_vod__c",
+            activityDatetime: "Activity_DateTime_vod__c",
+            eventType: {
+              name: "Event_type_vod__c",
+              values: {
+                clicked: "Clicked_vod",
+                opened: "Opened_vod",
+                viewed: "Viewed_vod",
+                delivered: "Delivered_vod",
+                bounced: "Bounced_vod",
+                dropped: "Dropped_vod",
+                downloaded: "Downloaded_vod",
+                unsubscribed: "Unsubscribed_vod",
+                unsubscribedAll: "Unsubscribed_All_vod",
+                markedSpam: "Marked_Spam_vod",
+                preferencesModified: "Preferences_Modified_vod",
+              },
+            },
+          },
+        },
+        approvedDocument: {
+          name: "Approved_Document_vod__c",
+          fields: { id: "ID", name: "Name", description: "Document_Description_vod__c", vaultDocumentId: "Vault_Document_Id_vod__c" },
+        },
+        callClickstream: {
+          name: "Call_Clickstream_vod__c",
+          fields: { trackElementId: "Track_Element_Id_vod__c", trackElementDescription: "Track_Element_Description_vod__c", trackElementType: "Track_Element_Type_vod__c" },
+        },
+        dynamicAttribute: {
+          name: "Dynamic_Attribute_vod__c",
+          fields: { accountId: "Account_vod__c", name: "Dynamic_Attribute_Name_vod__c", valueTextArea: "Dynamic_Attribute_Value_Text_Area_vod__c" },
+        },
+        tsf: {
+          name: "TSF_vod__c",
+          current: "TSF",
+          fields: { id: "ID", accountId: "Account_vod__c", territoryName: "Territory_vod__c" },
+        },
+        territory: {
+          name: "Territory2",
+          fields: { id: "ID", name: "Name" },
+        },
+        userTerritory: {
+          name: "UserTerritory2Association",
+          fields: { userId: "UserId", territoryId: "Territory2Id" },
+        },
+        user: {
+          name: "User",
+          current: "User",
+          fields: { id: "ID" },
+        },
+      },
+    },
+
+    vault: {
+      id: "vault",
+      idField: "id",
+      normalizeKey: (value) => String(value).replace(/__(v|c|sys)$/, "").replace(/_/g, "").toLowerCase(),
+      approvedDocumentId: (data) => (data.approved_document__v ? data.approved_document__v.id : null),
+      //Vault returns [{ name, label, isActive }]
+      picklistLabelsMap: (raw) => {
+        let map = {};
+        (Array.isArray(raw) ? raw : []).forEach((item) => {
+          map[item.name] = item.label;
+        });
+        return map;
+      },
+      objects: {
+        account: {
+          name: "account__v",
+          current: "account__v",
+          fields: { id: "id", name: "name__v", salutation: { name: "salutation__v", label: true }, typeId: "object_type__v" },
+        },
+        accountType: {
+          name: "object_type__v",
+          fields: {
+            id: "id",
+            name: "name__v",
+            key: { name: "api_name__v", key: true },
+            objectName: { name: "object_name__v", values: { account: "account__v" } },
+          },
+        },
+        call: {
+          name: "call2__v",
+          current: "call2__v",
+          fields: {
+            id: "id",
+            accountId: "account__v",
+            channel: {
+              name: "call_channel__v",
+              values: { faceToFace: "face_to_face__v", video: "video__v", phone: "phone__v", message: "message__v", email: "email__v", other: "other__v" },
+            },
+            datetime: "call_datetime__v",
+            date: "call_date__v",
+            status: { name: "call2_status__v", values: { submitted: "submitted__v", planned: "planned__v", saved: "saved__v" } },
+          },
+        },
+        callKeyMessage: {
+          name: "call2_key_message__v",
+          fields: {
+            id: "id",
+            accountId: "account__v",
+            callId: "call2__v",
+            callDate: "call_date__v",
+            startTime: "start_time__v",
+            keyMessageId: "key_message__v",
+            duration: "duration__v",
+            reaction: { name: "reaction__v", values: { positive: "positive__v", neutral: "neutral__v", negative: "negative__v" } },
+            displayOrder: "display_order__v",
+            keyMessageName: "key_message_name__v",
+            presentationName: "clm_presentation_name__v",
+          },
+        },
+        keyMessage: {
+          name: "key_message__v",
+          current: "key_message__v",
+          fields: {
+            id: "id",
+            name: "name__v",
+            mediaFileName: "media_file_name__v",
+            disableActions: "disable_actions__v",
+            iosResolution: "ios_resolution__v",
+            vaultDocId: "vault_doc_id__v",
+            status: { name: "key_message_status__v", values: { approved: "approved__v", staged: "staged__v", expired: "expired__v" } },
+            slideVersion: "slide_version__v",
+            vaultExternalId: "vault_external_id__v",
+          },
+        },
+        presentation: {
+          name: "clm_presentation__v",
+          current: "clm_presentation__v",
+          fields: {
+            id: "id",
+            name: "name__v",
+            status: { name: "clm_presentation_status__v", values: { approved: "approved__v", staged: "staged__v", expired: "expired__v" } },
+            vaultDocId: "vault_doc_id__v",
+            version: "version__v",
+            vaultExternalId: "vault_external_id__v",
+          },
+        },
+        presentationSlide: {
+          name: "clm_presentation_slide__v",
+          fields: { id: "id", keyMessageId: "key_message__v", presentationId: "clm_presentation__v", displayOrder: "display_order__v" },
+        },
+        sentEmail: {
+          name: "sent_email__v",
+          fields: {
+            id: "id",
+            accountId: "account__v",
+            emailFragments: "email_fragments__v",
+            emailTemplateId: "approved_email_template__v",
+            sentDate: "email_sent_date__v",
+            opened: "opened__v",
+            openCount: "open_count__v",
+            lastOpenDate: "last_open_date__v",
+            clickCount: "click_count__v",
+            lastActivityDate: "last_activity_date__v",
+            documentViews: "approved_document_views__v",
+            status: { name: "sent_email_status__v", values: { sent: "sent__v", delivered: "delivered__v" } },
+          },
+        },
+        emailActivity: {
+          name: "email_activity__v",
+          fields: {
+            id: "id",
+            sentEmailId: "sent_email__v",
+            approvedDocumentId: "approved_document__v",
+            vaultDocId: "vault_doc_id__v",
+            vaultDocName: "vault_doc_name__v",
+            vaultDocumentNumber: "vault_document_number__v",
+            activityDatetime: "activity_datetime__v",
+            eventType: {
+              name: "event_type__v",
+              values: {
+                clicked: "clicked__v",
+                opened: "opened__v",
+                viewed: "viewed__v",
+                delivered: "delivered__v",
+                bounced: "bounced__v",
+                dropped: "dropped__v",
+                downloaded: "downloaded__v",
+                unsubscribed: "unsubscribed__v",
+                unsubscribedAll: "unsubscribed_all__v",
+                markedSpam: "marked_spam__v",
+                preferencesModified: "preferences_modified__v",
+              },
+            },
+          },
+        },
+        approvedDocument: {
+          name: "approved_document__v",
+          fields: { id: "id", name: "name__v", description: "document_description__v", vaultDocumentId: "vault_document_id__v" },
+        },
+        callClickstream: {
+          name: "call_clickstream__v",
+          fields: { trackElementId: "track_element_id__v", trackElementDescription: "track_element_description__v", trackElementType: "track_element_type__v" },
+        },
+        dynamicAttribute: {
+          name: "dynamic_attribute__v",
+          fields: { accountId: "account__v", name: "dynamic_attribute_name__v", valueTextArea: "dynamic_attribute_value_text_area__v" },
+        },
+        tsf: {
+          name: "tsf__v",
+          current: "tsf__v",
+          fields: { id: "id", accountId: "account__v", territoryName: "territory_name__v" },
+        },
+        territory: {
+          name: "territory__v",
+          fields: { id: "id", name: "name__v" },
+        },
+        userTerritory: {
+          name: "user_territory__v",
+          fields: { userId: "user__v", territoryId: "territory__v" },
+        },
+        user: {
+          name: "user__sys",
+          current: "user__sys",
+          fields: { id: "id" },
+        },
+      },
+    },
+  },
+
+  /* INIT -------------------------------------------------*/
+  init: function (pJsLibrary) {
+    let jsLibrary = pJsLibrary == null ? "" : String(pJsLibrary);
+    let platform = this.constants.platformByLibrary[jsLibrary];
+    if (!platform) {
+      util.log(`crm.init: unknown project.jsLibrary "${jsLibrary}", using veeva-library.js`, "error");
+      platform = "veeva";
+    }
+    this.state.platform = platform;
+    this.state.loggedOnce = {};
+    this.state.labelCache = {};
+    this.state.initialized = true;
+  },
+
+  /* HELPERS ----------------------------------------------*/
+  helpers: {
+    driver: () => crm.drivers[crm.state.platform],
+
+    library: () => (typeof com !== "undefined" && com.veeva && com.veeva.clm ? com.veeva.clm : null),
+
+    logOnce: (pText) => {
+      if (crm.state.loggedOnce[pText]) return;
+      crm.state.loggedOnce[pText] = true;
+      util.log(pText, "error");
+    },
+
+    objectDef: (pObject) => {
+      let def = crm.helpers.driver().objects[pObject];
+      if (!def) {
+        crm.helpers.logOnce(`crm: unmapped object "${pObject}" (${crm.state.platform}), passed through`);
+        return { name: pObject, current: pObject, fields: {} };
+      }
+      return def;
+    },
+
+    //field definition as { name, values, key, label }
+    fieldDef: (pObjectDef, pObject, pField) => {
+      let def = pObjectDef.fields[pField];
+      if (typeof def === "string") return { name: def };
+      if (def) return def;
+      //client custom fields (config) are platform names already
+      if (/__c$/.test(pField)) return { name: pField };
+      crm.helpers.logOnce(`crm: unmapped field "${pObject}.${pField}" (${crm.state.platform}), passed through`);
+      return { name: pField };
+    },
+
+    //neutral value -> platform value
+    toPlatformValue: (pFieldDef, pObject, pField, pValue) => {
+      if (!pFieldDef.values || pValue == null || pValue === "") return pValue;
+      if (Object.prototype.hasOwnProperty.call(pFieldDef.values, pValue)) return pFieldDef.values[pValue];
+      crm.helpers.logOnce(`crm: unmapped value "${pValue}" for "${pObject}.${pField}" (${crm.state.platform}), passed through`);
+      return pValue;
+    },
+
+    //platform value -> neutral value
+    toNeutralValue: (pFieldDef, pObject, pField, pValue) => {
+      if (pValue == null || pValue === "") return pValue;
+      if (pFieldDef.key) return crm.helpers.driver().normalizeKey(pValue);
+      if (!pFieldDef.values) return pValue;
+      for (let neutral in pFieldDef.values) {
+        if (pFieldDef.values[neutral] === pValue) return neutral;
+      }
+      crm.helpers.logOnce(`crm: unmapped value "${pValue}" for "${pObject}.${pField}" (${crm.state.platform}), passed through`);
+      return pValue;
+    },
+
+    quote: (pValue) => {
+      let text = String(pValue);
+      //single quotes work on both platforms and are required for dates on Vault CRM
+      return text.indexOf("'") === -1 ? `'${text}'` : `"${text}"`;
+    },
+
+    renderClause: (pObjectDef, pObject, pClause) => {
+      if (pClause.or) {
+        return "(" + pClause.or.map((c) => crm.helpers.renderClause(pObjectDef, pObject, c)).join(" OR ") + ")";
+      }
+      let fieldDef = crm.helpers.fieldDef(pObjectDef, pObject, pClause.field);
+      let op = pClause.op || "=";
+      let values = Array.isArray(pClause.value) ? pClause.value : [pClause.value];
+      let parts = values.map((v) => `${fieldDef.name} ${op} ${crm.helpers.quote(crm.helpers.toPlatformValue(fieldDef, pObject, pClause.field, v))}`);
+      return parts.length > 1 ? "(" + parts.join(" OR ") + ")" : parts[0];
+    },
+
+    //conditions: [clause, ...] ANDed; clause: { field, op, value } (value array = any of) or { or: [clauses] }
+    renderWhere: (pObject, pConditions) => {
+      if (!pConditions || !pConditions.length) return null;
+      let objectDef = crm.helpers.objectDef(pObject);
+      let where = "WHERE " + pConditions.map((c) => crm.helpers.renderClause(objectDef, pObject, c)).join(" AND ");
+      if (where.length > crm.constants.maxWhereLength) {
+        util.log(`crm.query: where clause for ${pObject} is ${where.length} characters (limit about ${crm.constants.maxWhereLength})`, "error");
+      }
+      return where;
+    },
+
+    //sort: [{ field, dir }]
+    renderSort: (pObject, pSort) => {
+      if (!pSort || !pSort.length) return [];
+      let objectDef = crm.helpers.objectDef(pObject);
+      return pSort.map((s) => `${crm.helpers.fieldDef(objectDef, pObject, s.field).name}, ${s.dir === "DESC" ? "DESC" : "ASC"}`);
+    },
+
+    //platform record -> neutral record (only the requested fields)
+    toNeutralRecord: async (pObject, pFields, pRecord) => {
+      let objectDef = crm.helpers.objectDef(pObject);
+      let record = {};
+      for (let field of pFields) {
+        let fieldDef = crm.helpers.fieldDef(objectDef, pObject, field);
+        let value = pRecord ? pRecord[fieldDef.name] : undefined;
+        if (fieldDef.label && value) {
+          let labels = await crm.picklistLabels(pObject, field);
+          if (labels && labels[value] != null) value = labels[value];
+        } else {
+          value = crm.helpers.toNeutralValue(fieldDef, pObject, field, value);
+        }
+        record[field] = value;
+      }
+      return record;
+    },
+
+    //calls a com.veeva.clm method with a trailing callback; resolves with the raw result.
+    //Calls are queued: the libraries use one global callback per method, so overlapping calls would overwrite each other
+    call: (pMethod, pArgs) => {
+      let next = crm.state.queue.then(() => crm.helpers.callNow(pMethod, pArgs));
+      crm.state.queue = next.catch(() => {});
+      return next;
+    },
+
+    callNow: (pMethod, pArgs) => {
+      return new Promise((resolve) => {
+        let library = crm.helpers.library();
+        if (!library || typeof library[pMethod] !== "function") {
+          resolve({ success: false, message: `crm: CRM library not loaded (${pMethod})` });
+          return;
+        }
+        //a callback that never comes would block the queue
+        let timer = setTimeout(() => resolve({ success: false, message: `crm: no response from ${pMethod} after ${crm.constants.callTimeout} ms` }), crm.constants.callTimeout);
+        try {
+          library[pMethod](...pArgs, (data) => {
+            clearTimeout(timer);
+            resolve(data || { success: false, message: `crm: empty result (${pMethod})` });
+          });
+        } catch (err) {
+          clearTimeout(timer);
+          resolve({ success: false, message: `crm: ${pMethod} threw ${err}` });
+        }
+      });
+    },
+  },
+
+  /* API --------------------------------------------------*/
+  platform: function () {
+    return this.state.platform;
+  },
+
+  //getCurrent("presentation", ["id", "name"]) -> { id, name } | null when no field could be read
+  //pOptions.quiet: no error log when unavailable (e.g. polling the call outside a call)
+  getCurrent: async function (pObject, pFields, pOptions) {
+    let quiet = !!(pOptions && pOptions.quiet);
+    let fields = Array.isArray(pFields) ? pFields : [pFields];
+    let objectDef = this.helpers.objectDef(pObject);
+    let result = {};
+    let anySuccess = false;
+    for (let field of fields) {
+      let fieldDef = this.helpers.fieldDef(objectDef, pObject, field);
+      let data = await this.helpers.call("getDataForCurrentObject", [objectDef.current, fieldDef.name]);
+      if (data.success && data[objectDef.current]) {
+        let neutral = await this.helpers.toNeutralRecord(pObject, [field], data[objectDef.current]);
+        result[field] = neutral[field];
+        anySuccess = true;
+      } else {
+        if (!quiet) util.log(`crm.getCurrent: ${pObject}.${field} not available: ${data.message}`, "error");
+        result[field] = null;
+      }
+    }
+    return anySuccess ? result : null;
+  },
+
+  //query("call", ["id", "status"], [{ field: "status", value: ["submitted", "planned"] }], [{ field: "datetime", dir: "DESC" }])
+  query: async function (pObject, pFields, pConditions, pSort, pLimit) {
+    let objectDef = this.helpers.objectDef(pObject);
+    let platformFields = pFields.map((f) => this.helpers.fieldDef(objectDef, pObject, f).name);
+    let where = this.helpers.renderWhere(pObject, pConditions);
+    let sort = this.helpers.renderSort(pObject, pSort);
+    let data = await this.helpers.call("queryRecord", [objectDef.name, platformFields, where, sort, pLimit == null ? null : pLimit]);
+    if (!data.success) {
+      util.log(`crm.query: ${pObject} failed: ${data.message}`, "error");
+      return { success: false, records: [], message: data.message };
+    }
+    let records = [];
+    for (let record of data[objectDef.name] || []) {
+      records.push(await this.helpers.toNeutralRecord(pObject, pFields, record));
+    }
+    return { success: true, records: records, message: null };
+  },
+
+  //create("callClickstream", { trackElementId: "x" }) -> { success, id, message }
+  create: async function (pObject, pValues) {
+    let objectDef = this.helpers.objectDef(pObject);
+    let values = {};
+    for (let field in pValues) {
+      let fieldDef = this.helpers.fieldDef(objectDef, pObject, field);
+      values[fieldDef.name] = this.helpers.toPlatformValue(fieldDef, pObject, field, pValues[field]);
+    }
+    let data = await this.helpers.call("createRecord", [objectDef.name, values]);
+    let created = data[objectDef.name];
+    if (!data.success || !created) {
+      return { success: false, id: null, message: data.message || null, code: data.code };
+    }
+    return { success: true, id: created.ID || created.id || null, message: null };
+  },
+
+  //update("persistentStore", recordId, { value: "x" }) -> { success, id, message }
+  update: async function (pObject, pId, pValues) {
+    let objectDef = this.helpers.objectDef(pObject);
+    let values = {};
+    for (let field in pValues) {
+      let fieldDef = this.helpers.fieldDef(objectDef, pObject, field);
+      values[fieldDef.name] = this.helpers.toPlatformValue(fieldDef, pObject, field, pValues[field]);
+    }
+    let data = await this.helpers.call("updateRecord", [objectDef.name, pId, values]);
+    if (!data.success) {
+      return { success: false, id: null, message: data.message || null, code: data.code };
+    }
+    let updated = data[objectDef.name] || {};
+    return { success: true, id: updated.ID || updated.id || pId, message: null };
+  },
+
+  //adds a project object (names from config) to the current driver; fields: { <neutral>: <platform name> }, id added
+  registerObject: function (pObject, pPlatformName, pFields) {
+    let driver = this.helpers.driver();
+    driver.objects[pObject] = {
+      name: pPlatformName,
+      current: pPlatformName,
+      fields: Object.assign({ id: driver.idField }, pFields || {}),
+    };
+  },
+
+  //Approved_Document_vod__c.ID (Veeva) / approved_document__v.id (Vault), null when not found
+  approvedDocumentId: async function (pVaultUrl, pDocumentNumber) {
+    let data = await this.helpers.call("getApprovedDocument", [pVaultUrl, pDocumentNumber]);
+    let id = data.success ? this.helpers.driver().approvedDocumentId(data) : null;
+    return id || null;
+  },
+
+  launchApprovedEmail: async function (pTemplateId, pFragmentIds) {
+    let data = await this.helpers.call("launchApprovedEmail", [pTemplateId, pFragmentIds]);
+    return { success: !!data.success, message: data.message || null, code: data.code };
+  },
+
+  //picklistLabels("call", "channel") -> { faceToFace: "In-person", ... } (cached); {} on failure
+  picklistLabels: async function (pObject, pField) {
+    let cacheKey = `${pObject}.${pField}`;
+    if (this.state.labelCache[cacheKey]) return this.state.labelCache[cacheKey];
+    let objectDef = this.helpers.objectDef(pObject);
+    let fieldDef = this.helpers.fieldDef(objectDef, pObject, pField);
+    let data = await this.helpers.call("getPicklistValueLabels", [objectDef.name, fieldDef.name]);
+    if (!data.success || !data[objectDef.name]) {
+      util.log(`crm.picklistLabels: ${cacheKey} failed: ${data.message}`, "error");
+      return {};
+    }
+    let raw = this.helpers.driver().picklistLabelsMap(data[objectDef.name][fieldDef.name]);
+    let labels = {};
+    for (let value in raw) {
+      //label fields keep platform values as keys (they are replaced by the label, never compared)
+      let key = fieldDef.label ? value : this.helpers.toNeutralValue(fieldDef, pObject, pField, value);
+      labels[key] = raw[value];
+    }
+    this.state.labelCache[cacheKey] = labels;
+    return labels;
+  },
+
+  /* NAVIGATION (same library calls on both platforms) ---*/
+  gotoSlide: function (pMediaFileName, pPresentation) {
+    let library = this.helpers.library();
+    if (!library) return util.log("crm.gotoSlide: CRM library not loaded", "error");
+    if (pPresentation) library.gotoSlide(pMediaFileName, pPresentation);
+    else library.gotoSlide(pMediaFileName);
+  },
+  gotoSlideV2: function (pKeyMessageExternalId, pPresentationExternalId) {
+    let library = this.helpers.library();
+    if (!library) return util.log("crm.gotoSlideV2: CRM library not loaded", "error");
+    library.gotoSlideV2(pKeyMessageExternalId, pPresentationExternalId);
+  },
+  nextSlide: function () {
+    let library = this.helpers.library();
+    if (!library) return util.log("crm.nextSlide: CRM library not loaded", "error");
+    library.nextSlide();
+  },
+  prevSlide: function () {
+    let library = this.helpers.library();
+    if (!library) return util.log("crm.prevSlide: CRM library not loaded", "error");
+    library.prevSlide();
+  },
 };
 
 const ui = {
@@ -3305,18 +3978,19 @@ const ui = {
 
         //clickstream tracking
         if (vars.session.isAnActualCall && !vars.options.browserMode.active) {
-          let clickstreamRecord = {};
-          clickstreamRecord.Track_Element_Id_vod__c = pElId;
-          clickstreamRecord.Track_Element_Description_vod__c = "com.idc.ui.utilitiesMenu.clickstreamTracking." + pElId;
-          clickstreamRecord.Track_Element_Type_vod__c = "com.idc.ui.utilitiesMenu.clickstreamTracking";
-
-          com.veeva.clm.createRecord("Call_Clickstream_vod__c", clickstreamRecord, (data) => {
-            if (!data.success) {
-              util.log(`Utilmenu tracking ERROR (${data.code}) ${data.message}`, "error");
-            } else {
-              util.log(`Utilmenu tracking (${pElId})`);
-            }
-          });
+          crm
+            .create("callClickstream", {
+              trackElementId: pElId,
+              trackElementDescription: "com.idc.ui.utilitiesMenu.clickstreamTracking." + pElId,
+              trackElementType: "com.idc.ui.utilitiesMenu.clickstreamTracking",
+            })
+            .then((result) => {
+              if (!result.success) {
+                util.log(`Utilmenu tracking ERROR (${result.code}) ${result.message}`, "error");
+              } else {
+                util.log(`Utilmenu tracking (${pElId})`);
+              }
+            });
         } else {
           util.log(`Utilmenu tracking (simulated) ${pElId}`);
         }
@@ -3431,19 +4105,20 @@ const ui = {
         storage.sessionData.update();
 
         //clickstream tracking
-        if (vars.session.isAnActualCall && !vars.options.browserMode.simulate.active) {
-          let clickstreamRecord = {};
-          clickstreamRecord.Track_Element_Id_vod__c = relatedCLM.vaultExternalID.presentation;
-          clickstreamRecord.Track_Element_Description_vod__c = "com.idc.ui.utilitiesMenu.clickstreamTracking." + pCLMId;
-          clickstreamRecord.Track_Element_Type_vod__c = "com.idc.ui.utilitiesMenu.clickstreamTracking";
-
-          com.veeva.clm.createRecord("Call_Clickstream_vod__c", clickstreamRecord, (data) => {
-            if (!data.success) {
-              util.log(`Related CLM tracking ERROR (${data.code}) ${data.message}`, "error");
-            } else {
-              util.log(`Related CLM tracking (${pCLMId})`);
-            }
-          });
+        if (vars.session.isAnActualCall && !vars.options.browserMode.active) {
+          crm
+            .create("callClickstream", {
+              trackElementId: relatedCLM.vaultExternalID.presentation,
+              trackElementDescription: "com.idc.ui.utilitiesMenu.clickstreamTracking." + pCLMId,
+              trackElementType: "com.idc.ui.utilitiesMenu.clickstreamTracking",
+            })
+            .then((result) => {
+              if (!result.success) {
+                util.log(`Related CLM tracking ERROR (${result.code}) ${result.message}`, "error");
+              } else {
+                util.log(`Related CLM tracking (${pCLMId})`);
+              }
+            });
         } else {
           util.log(`Related CLM tracking (simulated) ${pCLMId}`);
         }
@@ -5254,8 +5929,8 @@ const smartNext = {
           }
         } else {
           if (item.keyMessage && item.presentation) {
-            util.log('[smartNext] navigateToFlowItem: Veeva → ' + item.keyMessage, 'info');
-            com.veeva.clm.gotoSlideV2(item.keyMessage, item.presentation);
+            util.log('[smartNext] navigateToFlowItem: CRM → ' + item.keyMessage, 'info');
+            crm.gotoSlideV2(item.keyMessage, item.presentation);
           } else {
             util.log('[smartNext] navigateToFlowItem: missing vault IDs for item', 'warn');
           }
@@ -8298,10 +8973,10 @@ const interactionSummary = {
   },
 
   fields: {
-    Call2_vod__c: [],
-    Call2_Key_Message_vod__c: [],
-    Sent_Email_vod__c: [],
-    Email_Activity_vod__c: [],
+    call: [],
+    callKeyMessage: [],
+    sentEmail: [],
+    emailActivity: [],
   },
 
   labels: {},
@@ -8393,11 +9068,11 @@ const interactionSummary = {
   },
 
   input: {
-    Call2_vod__c: [],
-    Planned_Call2_vod__c: [],
-    Call2_Key_Message_vod__c: [],
-    Sent_Email_vod__c: [],
-    Email_Activity_vod__c: [],
+    calls: [],
+    plannedCalls: [],
+    callKeyMessages: [],
+    sentEmails: [],
+    emailActivities: [],
   },
 
   output: {
@@ -8471,7 +9146,7 @@ const interactionSummary = {
             visitingThisWeek: null,
             hasCustomFlows: null,
           },
-          scheduledCalls: [], // { datetime, date, time, time_AMPM } – populated from Planned_Call2_vod__c; sorted ascending
+          scheduledCalls: [], // { datetime, date, time, time_AMPM } – populated from input.plannedCalls; sorted ascending
         },
         timeline: [
           {
@@ -8497,7 +9172,7 @@ const interactionSummary = {
             },
             call: {
               channel: null, //face-to-face or remote
-              status: null, //Saved_vod, Submitted_vod, Planned_vod
+              status: null, //saved, submitted, planned (neutral values, see crm module)
               presentations: [],
               slides: [
                 {
@@ -8613,6 +9288,7 @@ const interactionSummary = {
               },
             ],
             mostRecentCall: {
+              datetime: null, //CRM datetime (UTC ISO), used to compare calls
               date: null, //date
             },
             overall: {
@@ -8678,6 +9354,22 @@ const interactionSummary = {
     };
   },
 
+  // CRM datetimes are ISO in UTC ("2026-09-29T21:41:19.000Z") on both platforms: convert to the device's local date and 12h time
+  // (as scheduledCalls does); values without a time part (date-only fields) return undefined fields, as before
+  localDateTime: function (pValue) {
+    let result = { date: undefined, time: undefined, time_AMPM: undefined };
+    if (typeof pValue !== "string" || pValue.indexOf("T") <= 0) return result;
+
+    let d = new Date(pValue);
+    if (isNaN(d.getTime())) return result;
+
+    let hours = d.getHours();
+    result.date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    result.time = `${hours % 12 || 12}:${String(d.getMinutes()).padStart(2, "0")}`;
+    result.time_AMPM = hours < 12 ? "AM" : "PM";
+    return result;
+  },
+
   api: {
     generateDataModel: function (pAccountId) {
       const vars = clm.vars;
@@ -8701,12 +9393,13 @@ const interactionSummary = {
       //  2. Restrict options for all-accounts mode (performance)
       //  3. [CRM mode] Resolve Key Message CRM IDs for current slides and past versions (versionHistory)
       //  4. [CRM mode] Resolve Key Message CRM IDs for relatedCLM items (3 sequential queries per current item; 2 per past version)
-      //  5. Build keyMessagesMatrix: unified lookup table [{ ID, Media_File_Name_vod__c, Presentation, ThisPresentation }]
-      //  6. Query Call2_Key_Message_vod__c — batched by Key Message ID when considerCallsWithOtherPresentations=false
-      //  7. Query Call2_vod__c — batched by call ID, filtered by status
-      //  8. Query Sent_Email_vod__c — batched by account
-      //  9. [considerEmailsWithOtherTemplates] Resolve unknown template/fragment titles via Approved_Document_vod__c
-      // 10. Query Email_Activity_vod__c — batched by sent email
+      //  5. Build keyMessagesMatrix: unified lookup table [{ id, mediaFileName, presentation, thisPresentation }]
+      //  6. Query call key messages — batched by key message id when considerCallsWithOtherPresentations=false
+      //  7. Query calls — batched by call id, filtered by status
+      //  8. Query sent emails — batched by account
+      //  9. [considerEmailsWithOtherTemplates] Resolve unknown template/fragment titles via approved documents
+      // 10. Query email activities — batched by sent email
+      // All CRM access goes through the crm module (neutral object / field / picklist names)
       // 11. Build output model per account: account → timeline → slides → emails → relatedCLM
       return new Promise((resolve) => {
         (async () => {
@@ -8748,163 +9441,84 @@ const interactionSummary = {
 
                 //obtain Key Messages IDs of current presentation
                 if (interactionSummary.visibility.contentItems.thisPresentation) {
-                  await new Promise((resolve) => {
-                    com.veeva.clm.queryRecord("Key_Message_vod__c", ["ID", "Media_File_Name_vod__c"], null, [], null, (data) => {
-                      if (data.success) {
-                        //assign data.Key_Message_vod__c to each slide (current version)
-                        vars.slides.forEach((slide) => {
-                          let keyMessageRecord = data.Key_Message_vod__c.find((keyMessage) => {
-                            return keyMessage.Media_File_Name_vod__c == slide.player.zipName;
-                          });
-                          if (keyMessageRecord) {
-                            slide.player.keyMessageID = keyMessageRecord.ID;
-                          }
-                        });
-
-                        //also match past version zip names and store their Key Message IDs (normalized to current slide)
-                        interactionSummary.versionHistory.slides.forEach((entry) => {
-                          let slide = vars.slides.find((s) => s.id === entry.slideId);
-                          if (!slide) return;
-                          slide.player.pastKeyMessageIDs = [];
-                          entry.pastZipNames.forEach((pastZipName) => {
-                            let pastKeyMessageRecord = data.Key_Message_vod__c.find((km) => km.Media_File_Name_vod__c == pastZipName);
-                            if (pastKeyMessageRecord) {
-                              slide.player.pastKeyMessageIDs.push(pastKeyMessageRecord.ID);
-                            }
-                          });
-                        });
-
-                        resolve();
-                      } else {
-                        util.log(`interactionSummary.api.generateDataModel: failed to retrieve Key_Message_vod__c IDs ${data.message}`, "error");
-                        resolve();
+                  let keyMessages = await crm.query("keyMessage", ["id", "mediaFileName"], []);
+                  if (keyMessages.success) {
+                    //assign key message id to each slide (current version)
+                    vars.slides.forEach((slide) => {
+                      let keyMessageRecord = keyMessages.records.find((keyMessage) => {
+                        return keyMessage.mediaFileName == slide.player.zipName;
+                      });
+                      if (keyMessageRecord) {
+                        slide.player.keyMessageID = keyMessageRecord.id;
                       }
                     });
-                  });
+
+                    //also match past version zip names and store their Key Message IDs (normalized to current slide)
+                    interactionSummary.versionHistory.slides.forEach((entry) => {
+                      let slide = vars.slides.find((s) => s.id === entry.slideId);
+                      if (!slide) return;
+                      slide.player.pastKeyMessageIDs = [];
+                      entry.pastZipNames.forEach((pastZipName) => {
+                        let pastKeyMessageRecord = keyMessages.records.find((km) => km.mediaFileName == pastZipName);
+                        if (pastKeyMessageRecord) {
+                          slide.player.pastKeyMessageIDs.push(pastKeyMessageRecord.id);
+                        }
+                      });
+                    });
+                  } else {
+                    util.log(`interactionSummary.api.generateDataModel: failed to retrieve key message IDs ${keyMessages.message}`, "error");
+                  }
                 }
 
                 //obtain Key Messages IDs and zips of relatedCLM
                 if (vars.relatedCLMV2.items.length > 0 && interactionSummary.visibility.contentItems.relatedCLM) {
                   for (let relatedItem of vars.relatedCLMV2.items) {
                     if (relatedItem.available) {
-                      let thisCLMPresentation_ID = await new Promise((resolve) => {
-                        com.veeva.clm.queryRecord(
-                          "Clm_Presentation_vod__c",
-                          ["ID"],
-                          `Vault_External_Id_vod__c = "${relatedItem.vaultExternalID.presentation}"`,
-                          [],
-                          null,
-                          (data) => {
-                            if (data.success && data.Clm_Presentation_vod__c.length > 0) {
-                              resolve(data.Clm_Presentation_vod__c[0].ID);
-                            } else {
-                              util.log(
-                                `interactionSummary.api.generateDataModel: failed to retrieve Presentation_vod__c for relatedCLM ${relatedItem.id}, vaultDocId ${relatedItem.vaultExternalID.presentation}`,
-                                "error",
-                              );
-                            }
-                            resolve();
-                          },
-                        );
-                      });
+                      let presentations = await crm.query("presentation", ["id"], [{ field: "vaultExternalId", value: relatedItem.vaultExternalID.presentation }]);
+                      let thisCLMPresentation_ID = presentations.records.length > 0 ? presentations.records[0].id : null;
+                      if (!thisCLMPresentation_ID) {
+                        util.log(`interactionSummary.api.generateDataModel: failed to retrieve presentation for relatedCLM ${relatedItem.id}, vaultDocId ${relatedItem.vaultExternalID.presentation}`, "error");
+                      }
 
                       if (thisCLMPresentation_ID) {
-                        let thisCLMPresentation_Slides = await new Promise((resolve) => {
-                          com.veeva.clm.queryRecord(
-                            "Clm_Presentation_Slide_vod__c",
-                            ["ID", "Key_Message_vod__c"],
-                            `Clm_Presentation_vod__c = "${thisCLMPresentation_ID}"`,
-                            ["Display_Order_vod__c ASC"],
-                            null,
-                            (data) => {
-                              if (data.success && data.Clm_Presentation_Slide_vod__c.length > 0) {
-                                resolve(data.Clm_Presentation_Slide_vod__c);
-                              } else {
-                                util.log(
-                                  `interactionSummary.api.generateDataModel: failed to retrieve Clm_Presentation_Slide_vod__c for relatedCLM ${relatedItem.id}, vaultDocId ${relatedItem.vaultExternalID.presentation}`,
-                                  "error",
-                                );
-                              }
-                              resolve();
-                            },
-                          );
-                        });
+                        let slides = await crm.query("presentationSlide", ["id", "keyMessageId"], [{ field: "presentationId", value: thisCLMPresentation_ID }], [{ field: "displayOrder", dir: "ASC" }]);
+                        let thisCLMPresentation_Slides = slides.records;
+                        if (thisCLMPresentation_Slides.length == 0) {
+                          util.log(`interactionSummary.api.generateDataModel: failed to retrieve presentation slides for relatedCLM ${relatedItem.id}, vaultDocId ${relatedItem.vaultExternalID.presentation}`, "error");
+                        }
 
-                        if (thisCLMPresentation_Slides && thisCLMPresentation_Slides.length > 0) {
-                          let thisCLMPresentation_KeyMessages = await new Promise((resolve) => {
-                            let whereClause = thisCLMPresentation_Slides
-                              .map((slide) => {
-                                return `ID = "${slide.Key_Message_vod__c}" OR`;
-                              })
-                              .join(" ");
-                            whereClause = whereClause.slice(0, -3); //remove last OR
-                            com.veeva.clm.queryRecord("Key_Message_vod__c", ["ID", "Media_File_Name_vod__c"], whereClause, [], null, (data) => {
-                              if (data.success && data.Key_Message_vod__c.length > 0) {
-                                resolve(data.Key_Message_vod__c);
-                              } else {
-                                util.log(
-                                  `interactionSummary.api.generateDataModel: failed to retrieve Key_Message_vod__c for relatedCLM ${relatedItem.id}, vaultDocId ${relatedItem.vaultExternalID.presentation}`,
-                                  "error",
-                                );
-                              }
-                              resolve();
-                            });
-                          });
-                          relatedItem.zipFiles = thisCLMPresentation_KeyMessages;
+                        if (thisCLMPresentation_Slides.length > 0) {
+                          let keyMessages = await crm.query("keyMessage", ["id", "mediaFileName"], [{ field: "id", value: thisCLMPresentation_Slides.map((slide) => slide.keyMessageId) }]);
+                          if (keyMessages.records.length == 0) {
+                            util.log(`interactionSummary.api.generateDataModel: failed to retrieve key messages for relatedCLM ${relatedItem.id}, vaultDocId ${relatedItem.vaultExternalID.presentation}`, "error");
+                          }
+                          relatedItem.zipFiles = keyMessages.records.length > 0 ? keyMessages.records : undefined;
 
                           // Resolve past version Key Message IDs for this relatedCLM item.
-                          // Only 2 queries per past version: Clm_Presentation_vod__c → Clm_Presentation_Slide_vod__c.
+                          // Only 2 queries per past version: presentation → presentation slides.
                           // The KM ID is already a field on each slide record — no third query needed.
-                          // Media_File_Name_vod__c is intentionally omitted: relatedCLM is tracked at
-                          // presentation level only, so the matrix entry just needs Presentation + ID.
+                          // mediaFileName is intentionally omitted: relatedCLM is tracked at
+                          // presentation level only, so the matrix entry just needs presentation + id.
                           relatedItem.pastKeyMessageIDs = [];
                           let versionHistoryEntry = interactionSummary.versionHistory.relatedCLM.find((e) => e.relatedCLMId === relatedItem.id);
                           if (versionHistoryEntry) {
                             for (let pastVaultExternalID of versionHistoryEntry.pastVaultExternalIDs) {
-                              let pastCLMPresentation_ID = await new Promise((resolve) => {
-                                com.veeva.clm.queryRecord(
-                                  "Clm_Presentation_vod__c",
-                                  ["ID"],
-                                  `Vault_External_Id_vod__c = "${pastVaultExternalID}"`,
-                                  [],
-                                  null,
-                                  (data) => {
-                                    if (data.success && data.Clm_Presentation_vod__c.length > 0) {
-                                      resolve(data.Clm_Presentation_vod__c[0].ID);
-                                    } else {
-                                      util.log(`interactionSummary.api.generateDataModel: failed to retrieve past Clm_Presentation_vod__c for relatedCLM ${relatedItem.id}, pastVaultExternalID ${pastVaultExternalID}`, "error");
-                                      resolve();
-                                    }
-                                  },
-                                );
-                              });
+                              let pastPresentations = await crm.query("presentation", ["id"], [{ field: "vaultExternalId", value: pastVaultExternalID }]);
+                              let pastCLMPresentation_ID = pastPresentations.records.length > 0 ? pastPresentations.records[0].id : null;
+                              if (!pastCLMPresentation_ID) {
+                                util.log(`interactionSummary.api.generateDataModel: failed to retrieve past presentation for relatedCLM ${relatedItem.id}, pastVaultExternalID ${pastVaultExternalID}`, "error");
+                              }
 
                               if (pastCLMPresentation_ID) {
-                                let pastCLMPresentation_Slides = await new Promise((resolve) => {
-                                  com.veeva.clm.queryRecord(
-                                    "Clm_Presentation_Slide_vod__c",
-                                    ["ID", "Key_Message_vod__c"],
-                                    `Clm_Presentation_vod__c = "${pastCLMPresentation_ID}"`,
-                                    [],
-                                    null,
-                                    (data) => {
-                                      if (data.success && data.Clm_Presentation_Slide_vod__c.length > 0) {
-                                        resolve(data.Clm_Presentation_Slide_vod__c);
-                                      } else {
-                                        util.log(`interactionSummary.api.generateDataModel: failed to retrieve past Clm_Presentation_Slide_vod__c for relatedCLM ${relatedItem.id}, pastVaultExternalID ${pastVaultExternalID}`, "error");
-                                        resolve();
-                                      }
-                                    },
-                                  );
-                                });
-
-                                if (pastCLMPresentation_Slides) {
-                                  pastCLMPresentation_Slides.forEach((slide) => {
-                                    if (slide.Key_Message_vod__c && !relatedItem.pastKeyMessageIDs.includes(slide.Key_Message_vod__c)) {
-                                      relatedItem.pastKeyMessageIDs.push(slide.Key_Message_vod__c);
-                                    }
-                                  });
+                                let pastSlides = await crm.query("presentationSlide", ["id", "keyMessageId"], [{ field: "presentationId", value: pastCLMPresentation_ID }]);
+                                if (pastSlides.records.length == 0) {
+                                  util.log(`interactionSummary.api.generateDataModel: failed to retrieve past presentation slides for relatedCLM ${relatedItem.id}, pastVaultExternalID ${pastVaultExternalID}`, "error");
                                 }
+                                pastSlides.records.forEach((slide) => {
+                                  if (slide.keyMessageId && !relatedItem.pastKeyMessageIDs.includes(slide.keyMessageId)) {
+                                    relatedItem.pastKeyMessageIDs.push(slide.keyMessageId);
+                                  }
+                                });
                               }
                             }
                           }
@@ -8924,26 +9538,26 @@ const interactionSummary = {
                     })
                     .forEach((slide) => {
                       keyMessagesMatrix.push({
-                        Presentation: labels.accountView.thisPresentation,
-                        ID: slide.player.keyMessageID,
-                        Media_File_Name_vod__c: slide.player.zipName,
-                        ThisPresentation: true,
+                        presentation: labels.accountView.thisPresentation,
+                        id: slide.player.keyMessageID,
+                        mediaFileName: slide.player.zipName,
+                        thisPresentation: true,
                       });
                     });
 
-                  // Past-version IDs are pushed with Media_File_Name_vod__c set to the *current* zip name.
-                  // This means Call2_Key_Message_vod__c records from old presentations are returned by the query
+                  // Past-version IDs are pushed with mediaFileName set to the *current* zip name.
+                  // This means call key message records from old presentations are returned by the query
                   // and then enriched/attributed to the current slide identity — no downstream model changes needed.
                   vars.slides
                     .filter((slide) => slide.player.pastKeyMessageIDs && slide.player.pastKeyMessageIDs.length > 0)
                     .forEach((slide) => {
                       slide.player.pastKeyMessageIDs.forEach((pastKeyMessageID) => {
-                        if (!keyMessagesMatrix.find((km) => km.ID === pastKeyMessageID)) {
+                        if (!keyMessagesMatrix.find((km) => km.id === pastKeyMessageID)) {
                           keyMessagesMatrix.push({
-                            Presentation: labels.accountView.thisPresentation,
-                            ID: pastKeyMessageID,
-                            Media_File_Name_vod__c: slide.player.zipName,
-                            ThisPresentation: true,
+                            presentation: labels.accountView.thisPresentation,
+                            id: pastKeyMessageID,
+                            mediaFileName: slide.player.zipName,
+                            thisPresentation: true,
                           });
                         }
                       });
@@ -8958,28 +9572,28 @@ const interactionSummary = {
                       .forEach((relatedItem) => {
                         relatedItem.zipFiles.forEach((zipFile) => {
                           keyMessagesMatrix.push({
-                            Presentation: relatedItem.name,
-                            ID: zipFile.ID,
-                            Media_File_Name_vod__c: zipFile.Media_File_Name_vod__c,
-                            RelartedCLM: true,
+                            presentation: relatedItem.name,
+                            id: zipFile.id,
+                            mediaFileName: zipFile.mediaFileName,
+                            relatedCLM: true,
                           });
                         });
                       });
                   }
 
                   // Past-version Key Message IDs for relatedCLM items.
-                  // Only Presentation + ID are needed — relatedCLM is tracked at presentation level only.
+                  // Only presentation + id are needed — relatedCLM is tracked at presentation level only.
                   if (vars.relatedCLMV2.items.length > 0 && interactionSummary.visibility.contentItems.relatedCLM) {
                     vars.relatedCLMV2.items
                       .filter((relatedItem) => relatedItem.available && relatedItem.pastKeyMessageIDs && relatedItem.pastKeyMessageIDs.length > 0)
                       .forEach((relatedItem) => {
                         relatedItem.pastKeyMessageIDs.forEach((pastID) => {
-                          if (!keyMessagesMatrix.find((km) => km.ID === pastID)) {
+                          if (!keyMessagesMatrix.find((km) => km.id === pastID)) {
                             keyMessagesMatrix.push({
-                              Presentation: relatedItem.name,
-                              ID: pastID,
-                              Media_File_Name_vod__c: null,
-                              RelartedCLM: true,
+                              presentation: relatedItem.name,
+                              id: pastID,
+                              mediaFileName: null,
+                              relatedCLM: true,
                             });
                           }
                         });
@@ -8987,160 +9601,111 @@ const interactionSummary = {
                   }
                 }
 
-                //Call_Key_Message_vod__c for current slides and related CLM (if needed)
+                //call key messages for current slides and related CLM (if needed)
                 let callKeyMessageRecords = [];
                 {
+                  const accountCondition = pAccountId ? [{ field: "accountId", value: vars.metadata.account.id }] : [];
                   if (options.considerCallsWithOtherPresentations) {
                     //no key message ID filter: single query filtered by account only (or all accounts)
-                    const singleWhereClause = pAccountId ? `Account_vod__c = "${vars.metadata.account.id}"` : null;
-                    callKeyMessageRecords = await new Promise((resolve) => {
-                      com.veeva.clm.queryRecord("Call2_Key_Message_vod__c", fields.Call2_Key_Message_vod__c, singleWhereClause, [], null, (data) => {
-                        if (data.success) {
-                          resolve(data.Call2_Key_Message_vod__c);
-                        } else {
-                          util.log(`interactionSummary.api.generateDataModel: failed to retrieve Call2_Key_Message_vod__c records ${data.message}`, "error");
-                          resolve([]);
-                        }
-                      });
-                    });
+                    let result = await crm.query("callKeyMessage", fields.callKeyMessage, accountCondition);
+                    if (!result.success) util.log(`interactionSummary.api.generateDataModel: failed to retrieve call key message records ${result.message}`, "error");
+                    callKeyMessageRecords = result.records;
                   } else {
                     //filter by key message IDs: batch queries to respect ~1000-char WHERE clause limit
-                    const kmIdBatches = util.chunkArray([...new Set(keyMessagesMatrix.map((item) => item.ID))], 15);
+                    const kmIdBatches = util.chunkArray([...new Set(keyMessagesMatrix.map((item) => item.id))], 15);
                     for (const kmIdBatch of kmIdBatches) {
-                      let batchWhereClause = kmIdBatch.map((id) => `Key_Message_vod__c = "${id}" OR`).join(" ").slice(0, -3);
-                      if (pAccountId) {
-                        batchWhereClause = `Account_vod__c = "${vars.metadata.account.id}" AND (${batchWhereClause})`;
-                      }
-                      const batchRecords = await new Promise((resolve) => {
-                        com.veeva.clm.queryRecord("Call2_Key_Message_vod__c", fields.Call2_Key_Message_vod__c, batchWhereClause, [], null, (data) => {
-                          if (data.success) {
-                            resolve(data.Call2_Key_Message_vod__c);
-                          } else {
-                            util.log(`interactionSummary.api.generateDataModel: failed to retrieve Call2_Key_Message_vod__c batch ${data.message}`, "error");
-                            resolve([]);
-                          }
-                        });
-                      });
-                      callKeyMessageRecords = callKeyMessageRecords.concat(batchRecords);
+                      let result = await crm.query("callKeyMessage", fields.callKeyMessage, accountCondition.concat([{ field: "keyMessageId", value: kmIdBatch }]));
+                      if (!result.success) util.log(`interactionSummary.api.generateDataModel: failed to retrieve call key message batch ${result.message}`, "error");
+                      callKeyMessageRecords = callKeyMessageRecords.concat(result.records);
                     }
                   }
 
                   //add keyMessage attributes to callKeyMessageRecords
-                  // Enrich each record: replace the flat Key_Message_vod__c ID with a structured object
-                  // containing the zip name and presentation. Past-version IDs resolve to the current
-                  // slide's zip name via the normalized matrix entries.
-                  if (callKeyMessageRecords) {
-                    callKeyMessageRecords.forEach((callKeyMessage) => {
-                      let keyMessagesMatrixRecord = keyMessagesMatrix.find((keyMessage) => {
-                        return keyMessage.ID == callKeyMessage.Key_Message_vod__c;
-                      });
-                      let mediaFileName = keyMessagesMatrixRecord ? keyMessagesMatrixRecord.Media_File_Name_vod__c : null;
-
-                      callKeyMessage.Key_Message_vod__c = {
-                        id: callKeyMessage.Key_Message_vod__c,
-                        Key_Message_Name_vod__c: callKeyMessage.Key_Message_Name_vod__c,
-                        Media_File_Name_vod__c: mediaFileName,
-                        presentation: keyMessagesMatrixRecord ? keyMessagesMatrixRecord.Presentation : callKeyMessage.Clm_Presentation_Name_vod__c,
-                        thisPresentation: keyMessagesMatrixRecord ? keyMessagesMatrixRecord.ThisPresentation : false,
-                      };
+                  // Enrich each record with a keyMessage object containing the zip name and presentation.
+                  // Past-version IDs resolve to the current slide's zip name via the normalized matrix entries.
+                  callKeyMessageRecords.forEach((callKeyMessage) => {
+                    let keyMessagesMatrixRecord = keyMessagesMatrix.find((keyMessage) => {
+                      return keyMessage.id == callKeyMessage.keyMessageId;
                     });
-                  }
+
+                    callKeyMessage.keyMessage = {
+                      id: callKeyMessage.keyMessageId,
+                      name: callKeyMessage.keyMessageName,
+                      mediaFileName: keyMessagesMatrixRecord ? keyMessagesMatrixRecord.mediaFileName : null,
+                      presentation: keyMessagesMatrixRecord ? keyMessagesMatrixRecord.presentation : callKeyMessage.presentationName,
+                      thisPresentation: keyMessagesMatrixRecord ? keyMessagesMatrixRecord.thisPresentation : false,
+                    };
+                  });
 
                   //add to interaction summary input
-                  if (callKeyMessageRecords) {
-                    input.Call2_Key_Message_vod__c = callKeyMessageRecords;
-                  }
+                  input.callKeyMessages = callKeyMessageRecords;
                 }
 
-                // Call IDs are derived from Call2_Key_Message_vod__c rather than querying all calls directly.
+                // Call IDs are derived from call key messages rather than querying all calls directly.
                 // This avoids a full-table scan and limits results to calls that actually showed tracked slides.
                 let callRecords = [];
                 {
-                  if (input.Call2_Key_Message_vod__c.length > 0) {
+                  if (input.callKeyMessages.length > 0) {
                     //unique call IDs from call key message records
-                    let uniqueCallIds = [...new Set(input.Call2_Key_Message_vod__c.map((callKeyMessage) => callKeyMessage.Call2_vod__c))];
+                    let uniqueCallIds = [...new Set(input.callKeyMessages.map((callKeyMessage) => callKeyMessage.callId))];
 
-                    // Split unique call IDs into batches of 500
+                    //statuses
+                    let statuses = ["submitted", "planned"];
+                    if (options.considerSavedCalls) statuses.push("saved");
+
+                    // Split unique call IDs into batches of 300
                     const callIdBatches = util.chunkArray(uniqueCallIds, 300);
 
                     // Process each batch and collect all results
                     for (const callIdBatch of callIdBatches) {
-                      //where clause for current batch
-                      let whereClause;
-                      {
-                        //where clause for call IDs in current batch
-                        let callIDsWhereClause = callIdBatch
-                          .map((callId) => {
-                            return `ID = "${callId}" OR`;
-                          })
-                          .join(" ")
-                          .slice(0, -3); //remove last OR
+                      let conditions = [
+                        { field: "id", value: callIdBatch },
+                        { field: "status", value: statuses },
+                      ];
+                      if (pAccountId) conditions.unshift({ field: "accountId", value: vars.metadata.account.id });
 
-                        //status where clause
-                        let statusWhereClause = `Status_vod__c = "Submitted_vod" OR Status_vod__c = "Planned_vod"`;
-                        if (options.considerSavedCalls) {
-                          statusWhereClause += ` OR Status_vod__c = "Saved_vod"`;
-                        }
-
-                        //final where clause
-                        if (pAccountId) {
-                          whereClause = `Account_vod__c = "${vars.metadata.account.id}" AND (${callIDsWhereClause}) AND (${statusWhereClause})`;
-                        } else {
-                          whereClause = `(${callIDsWhereClause}) AND (${statusWhereClause})`;
-                        }
-                      }
-
-                      //query Call2_vod__c records for current batch
-                      const batchCallRecords = await new Promise((resolve) => {
-                        com.veeva.clm.queryRecord("Call2_vod__c", fields.Call2_vod__c, whereClause, [], null, (data) => {
-                          if (data.success) {
-                            resolve(data.Call2_vod__c);
-                          } else {
-                            util.log(`interactionSummary.api.generateDataModel: failed to retrieve Call2_vod__c records for batch ${data.message}`, "error");
-                            resolve([]);
-                          }
-                        });
-                      });
+                      let result = await crm.query("call", fields.call, conditions);
+                      if (!result.success) util.log(`interactionSummary.api.generateDataModel: failed to retrieve call records for batch ${result.message}`, "error");
 
                       // Append batch results to main callRecords array
-                      callRecords = callRecords.concat(batchCallRecords);
+                      callRecords = callRecords.concat(result.records);
                     }
 
                     //add presentations to retrieved callRecords
                     callRecords.forEach((callRecord) => {
                       callKeyMessageRecords
                         .filter((callKeyMessage) => {
-                          return callKeyMessage.Call2_vod__c == callRecord.ID;
+                          return callKeyMessage.callId == callRecord.id;
                         })
                         .forEach((callKeyMessage) => {
                           let presentationName, thisPresentation;
 
                           //find presentation from keyMessagesMatrix
                           let keyMessagesMatrixRecord = keyMessagesMatrix.find((keyMessage) => {
-                            return keyMessage.ID == callKeyMessage.Key_Message_vod__c.id;
+                            return keyMessage.id == callKeyMessage.keyMessage.id;
                           });
 
                           if (keyMessagesMatrixRecord) {
                             //use presentation from matrix
-                            presentationName = keyMessagesMatrixRecord.Presentation;
-                            thisPresentation = keyMessagesMatrixRecord.ThisPresentation;
+                            presentationName = keyMessagesMatrixRecord.presentation;
+                            thisPresentation = keyMessagesMatrixRecord.thisPresentation;
                           } else {
                             //use callKeyMessage presentation if not found in matrix (should not happen)
-                            presentationName = callKeyMessage.Clm_Presentation_Name_vod__c;
+                            presentationName = callKeyMessage.presentationName;
                           }
 
-                          //initialize Presentations array if not present
-                          if (!callRecord.Presentations) {
-                            callRecord.Presentations = [];
+                          //initialize presentations array if not present
+                          if (!callRecord.presentations) {
+                            callRecord.presentations = [];
                           }
 
                           //add presentation to callRecord if not already present
                           if (
-                            !callRecord.Presentations.find((presentation) => {
+                            !callRecord.presentations.find((presentation) => {
                               return presentation.name == presentationName;
                             })
                           ) {
-                            callRecord.Presentations.push({
+                            callRecord.presentations.push({
                               name: presentationName,
                               thisPresentation: thisPresentation,
                             });
@@ -9148,14 +9713,12 @@ const interactionSummary = {
                         });
                     });
 
-                    if (callRecords) {
-                      input.Call2_vod__c = callRecords;
-                    }
+                    input.calls = callRecords;
                   }
                 }
 
-                //Planned Call2_vod__c records for "visiting this week" flag
-                //Query Planned calls within this week's date range (separate from calls with key messages)
+                //planned calls for "visiting this week" flag
+                //Query calls within this week's date range (separate from calls with key messages)
                 let plannedCallRecords = [];
                 {
                   let thisWeeksMonday = new Date();
@@ -9168,116 +9731,77 @@ const interactionSummary = {
                   // Format dates as YYYY-MM-DD
                   let thisWeeksMondayStr = thisWeeksMonday.toISOString().split('T')[0];
                   let thisWeeksSaturdayStr = thisWeeksSaturday.toISOString().split('T')[0];
-                  
-                  // NOTE: Status_vod__c = "Planned_vod" to return just planned calls
-                  let whereClause = `Call_Datetime_vod__c > "${thisWeeksMondayStr}" AND Call_Datetime_vod__c < "${thisWeeksSaturdayStr}"`;
-                  if (pAccountId) {
-                    whereClause = `Account_vod__c = "${pAccountId}" AND ${whereClause}`;
-                  }
-                  // Query minimal fields needed for "visiting this week": ID, Account_vod__c, Call_Datetime_vod__c
-                  plannedCallRecords = await new Promise((resolve) => {
-                    com.veeva.clm.queryRecord("Call2_vod__c", ["ID", "Account_vod__c", "Call_Datetime_vod__c"], whereClause, [], null, (data) => {
-                      if (data.success) {
-                        resolve(data.Call2_vod__c);
-                      } else {
-                        util.log(`interactionSummary.api.generateDataModel: failed to retrieve Planned Call2_vod__c records ${data.message}`, "error");
-                        resolve([]);
-                      }
-                    });
-                  });
 
-                  if (plannedCallRecords) {
-                    input.Planned_Call2_vod__c = plannedCallRecords;
-                  }
+                  // NOTE: add { field: "status", value: "planned" } to return just planned calls
+                  let conditions = [
+                    { field: "datetime", op: ">", value: thisWeeksMondayStr },
+                    { field: "datetime", op: "<", value: thisWeeksSaturdayStr },
+                  ];
+                  if (pAccountId) conditions.unshift({ field: "accountId", value: pAccountId });
+
+                  // Query minimal fields needed for "visiting this week": id, accountId, datetime
+                  let result = await crm.query("call", ["id", "accountId", "datetime"], conditions);
+                  if (!result.success) util.log(`interactionSummary.api.generateDataModel: failed to retrieve planned call records ${result.message}`, "error");
+                  plannedCallRecords = result.records;
+
+                  input.plannedCalls = plannedCallRecords;
                 }
 
-                //Sent_Email_vod__c records
+                //sent emails
                 if ((vars.emailCart.active || vars.rteBuilder.active) && interactionSummary.visibility.contentItems.emails) {
                   let sentEmailRecords = [];
                   //query records
                   {
-                    // all templates and where clause
+                    // all templates
                     let allTemplates = (vars.emailCart.active ? vars.emailCart.templates : [])
                       .concat(nonEmailCartItems.templates)
                       .concat(vars.rteBuilder.active ? vars.rteBuilder.templates : []);
-                    let allTemplatesWhereClause;
+                    let templateCondition = null;
+                    let noTemplatesWithCrmId = false;
 
                     //bypass this filtering if considerEmailsWithOtherTemplates is true
-                    if (options.considerEmailsWithOtherTemplates) {
-                      allTemplatesWhereClause = null;
-                    } else {
-                      //resolve [] if no templates have crmId
-                      if (
-                        allTemplates.filter((template) => {
-                          return template.crmId;
-                        }).length == 0
-                      ) {
+                    if (!options.considerEmailsWithOtherTemplates) {
+                      let templateCrmIds = allTemplates.filter((template) => template.crmId).map((template) => template.crmId);
+
+                      //no sent emails if no templates have crmId (skip the query only; the rest of the model, e.g. allAccounts, is still built)
+                      if (templateCrmIds.length == 0) {
                         util.log(`interactionSummary.api.generateDataModel: no templates with crmId`, "error");
-                        resolve([]);
-                        return;
+                        noTemplatesWithCrmId = true;
                       }
 
-                      //set all templates where clause
-                      allTemplatesWhereClause = allTemplates
-                        .filter((template) => {
-                          return template.crmId;
-                        })
-                        .map((template) => {
-                          return `Approved_Email_Template_vod__c = "${template.crmId}" OR`;
-                        })
-                        .join(" ")
-                        .slice(0, -3);
+                      templateCondition = { field: "emailTemplateId", value: templateCrmIds };
                     }
 
-                    // Split accounts into batches of 30
+                    // Split accounts into batches of 10
                     let accountsToProcess = [];
                     if (pAccountId) {
                       accountsToProcess.push(vars.metadata.account);
                     } else {
                       accountsToProcess = vars.metadata.allAccounts;
                     }
-                    const accountBatches = util.chunkArray(accountsToProcess, 10);
+                    const accountBatches = noTemplatesWithCrmId ? [] : util.chunkArray(accountsToProcess, 10);
 
                     // Process each batch and collect all results
                     for (const accountBatch of accountBatches) {
-                      const batchSentEmailRecords = await new Promise((resolve) => {
-                        // Create account IDs where clause for current batch
-                        let accountIDsWhereClause = accountBatch
-                          .map((account) => {
-                            return `Account_vod__c = "${account.id}" OR`;
-                          })
-                          .join(" ")
-                          .slice(0, -3); //remove last OR
+                      let conditions = [
+                        { field: "status", value: ["sent", "delivered"] },
+                        { field: "accountId", value: accountBatch.map((account) => account.id) },
+                      ];
+                      if (templateCondition) conditions.push(templateCondition);
 
-                        //where
-                        let whereClause = `(Status_vod__c = "Sent_vod" OR Status_vod__c = "Delivered_vod") AND (${accountIDsWhereClause})`;
-                        if (allTemplatesWhereClause) {
-                          whereClause += ` AND (${allTemplatesWhereClause})`;
-                        }
-
-                        //query Sent_Email_vod__c records for current batch
-                        com.veeva.clm.queryRecord("Sent_Email_vod__c", fields.Sent_Email_vod__c, whereClause, [], null, (data) => {
-                          if (data.success) {
-                            resolve(data.Sent_Email_vod__c);
-                          } else {
-                            util.log(`interactionSummary.api.generateDataModel: failed to retrieve Sent_Email_vod__c records for batch ${data.message}`, "error");
-                            resolve([]);
-                          }
-                        });
-                      });
+                      let result = await crm.query("sentEmail", fields.sentEmail, conditions);
+                      if (!result.success) util.log(`interactionSummary.api.generateDataModel: failed to retrieve sent email records for batch ${result.message}`, "error");
 
                       // Append batch results to main sentEmailRecords array
-                      sentEmailRecords = sentEmailRecords.concat(batchSentEmailRecords);
+                      sentEmailRecords = sentEmailRecords.concat(result.records);
                     }
                   }
 
                   //add to interaction summary input
-                  if (sentEmailRecords) {
-                    input.Sent_Email_vod__c = sentEmailRecords;
-                  }
+                  input.sentEmails = sentEmailRecords;
 
                   //add templates and fragments to nonEmailCartTemplates (if considerEmailsWithOtherTemplates is true)
-                  if (sentEmailRecords && options.considerEmailsWithOtherTemplates) {
+                  if (options.considerEmailsWithOtherTemplates) {
                     let record = {
                       id: null,
                       title: null,
@@ -9288,16 +9812,16 @@ const interactionSummary = {
 
                     sentEmailRecords.forEach((sentEmail) => {
                       let templateIndex = nonEmailCartItems.templates.findIndex((template) => {
-                        return template.crmId == sentEmail.Approved_Email_Template_vod__c;
+                        return template.crmId == sentEmail.emailTemplateId;
                       });
                       if (templateIndex < 0 && vars.emailCart.active) {
                         templateIndex = vars.emailCart.templates.findIndex((template) => {
-                          return template.crmId == sentEmail.Approved_Email_Template_vod__c;
+                          return template.crmId == sentEmail.emailTemplateId;
                         });
                       }
                       if (templateIndex < 0 && vars.rteBuilder.active) {
                         templateIndex = vars.rteBuilder.templates.findIndex((template) => {
-                          return template.crmId == sentEmail.Approved_Email_Template_vod__c;
+                          return template.crmId == sentEmail.emailTemplateId;
                         });
                       }
 
@@ -9306,8 +9830,8 @@ const interactionSummary = {
                         let newTemplate = JSON.parse(JSON.stringify(record));
                         newTemplate.added = true;
                         newTemplate.available = true;
-                        newTemplate.id = `nonEmailCartTemplate_${sentEmail.Approved_Email_Template_vod__c}`;
-                        newTemplate.crmId = sentEmail.Approved_Email_Template_vod__c;
+                        newTemplate.id = `nonEmailCartTemplate_${sentEmail.emailTemplateId}`;
+                        newTemplate.crmId = sentEmail.emailTemplateId;
                         newTemplate.thumb = "";
                         newTemplate.title = "";
                         newTemplate.vaultId = "";
@@ -9321,9 +9845,9 @@ const interactionSummary = {
 
                       //check for fragments
                       //note: email fragments not sent will not be considered for templates queried here
-                      if (sentEmail.Email_Fragments_vod__c && sentEmail.Email_Fragments_vod__c.length > 0) {
+                      if (sentEmail.emailFragments && sentEmail.emailFragments.length > 0) {
                         let thisTemplate = nonEmailCartItems.templates[templateIndex];
-                        let emailFragmentsArr = sentEmail.Email_Fragments_vod__c.split(",");
+                        let emailFragmentsArr = sentEmail.emailFragments.split(",");
                         emailFragmentsArr.forEach((fragmentCRMID) => {
                           if (thisTemplate.fragments.findIndex((fragment) => fragment.crmId == fragmentCRMID) < 0) {
                             let newFragment = JSON.parse(JSON.stringify(record));
@@ -9356,36 +9880,11 @@ const interactionSummary = {
 
                       // Process each batch and collect all results
                       for (const crmIdBatch of crmIdBatches) {
-                        let whereClause = crmIdBatch
-                          .map((crmId) => {
-                            return `ID = "${crmId}" OR`;
-                          })
-                          .join(" ");
-                        whereClause = whereClause.slice(0, -3); //remove last OR
-
-                        const batchDocumentRecords = await new Promise((resolve) => {
-                          com.veeva.clm.queryRecord(
-                            "Approved_Document_vod__c",
-                            ["ID", "Document_Description_vod__c", "Name", "Vault_Document_Id_vod__c"],
-                            whereClause,
-                            [],
-                            null,
-                            (data) => {
-                              if (data.success) {
-                                resolve(data.Approved_Document_vod__c);
-                              } else {
-                                util.log(
-                                  `interactionSummary.api.generateDataModel: failed to retrieve Approved_Document_vod__c records for batch ${data.message}`,
-                                  "error",
-                                );
-                                resolve([]);
-                              }
-                            },
-                          );
-                        });
+                        let result = await crm.query("approvedDocument", ["id", "description", "name", "vaultDocumentId"], [{ field: "id", value: crmIdBatch }]);
+                        if (!result.success) util.log(`interactionSummary.api.generateDataModel: failed to retrieve approved document records for batch ${result.message}`, "error");
 
                         // Append batch results to main documentRecords array
-                        documentRecords = documentRecords.concat(batchDocumentRecords);
+                        documentRecords = documentRecords.concat(result.records);
                       }
                     }
 
@@ -9394,28 +9893,28 @@ const interactionSummary = {
                       if (!template.added) return; //skip original templates
 
                       let documentRecord = documentRecords.find((doc) => {
-                        return doc.ID == template.crmId;
+                        return doc.id == template.crmId;
                       });
                       if (documentRecord) {
-                        if (documentRecord.Document_Description_vod__c && documentRecord.Document_Description_vod__c != "") {
-                          template.title = documentRecord.Document_Description_vod__c;
+                        if (documentRecord.description && documentRecord.description != "") {
+                          template.title = documentRecord.description;
                         } else {
-                          template.title = documentRecord.Name;
+                          template.title = documentRecord.name;
                         }
-                        template.vaultId = documentRecord.Vault_Document_Id_vod__c;
+                        template.vaultId = documentRecord.vaultDocumentId;
                         template.title += ` (${template.vaultId.toString()})`;
                       }
                       template.fragments.forEach((fragment) => {
                         let documentRecord = documentRecords.find((doc) => {
-                          return doc.ID == fragment.crmId;
+                          return doc.id == fragment.crmId;
                         });
                         if (documentRecord) {
-                          if (documentRecord.Document_Description_vod__c && documentRecord.Document_Description_vod__c != "") {
-                            fragment.title = documentRecord.Document_Description_vod__c;
+                          if (documentRecord.description && documentRecord.description != "") {
+                            fragment.title = documentRecord.description;
                           } else {
-                            fragment.title = documentRecord.Name;
+                            fragment.title = documentRecord.name;
                           }
-                          fragment.vaultId = documentRecord.Vault_Document_Id_vod__c;
+                          fragment.vaultId = documentRecord.vaultDocumentId;
                           fragment.title += ` (${fragment.vaultId.toString()})`;
                         }
                       });
@@ -9446,41 +9945,24 @@ const interactionSummary = {
                   }
                 }
 
-                //Email_Activity_vod__c records
+                //email activities
                 if ((vars.emailCart.active || vars.rteBuilder.active) && interactionSummary.visibility.contentItems.emails) {
                   let emailActivityRecords = [];
-                  if (input.Sent_Email_vod__c && input.Sent_Email_vod__c.length > 0) {
+                  if (input.sentEmails && input.sentEmails.length > 0) {
                     // Split sent emails into batches (using 500 as a reasonable batch size for email activity records)
-                    const sentEmailBatches = util.chunkArray(input.Sent_Email_vod__c, 500);
+                    const sentEmailBatches = util.chunkArray(input.sentEmails, 500);
 
                     // Process each batch and collect all results
                     for (const sentEmailBatch of sentEmailBatches) {
-                      const batchEmailActivityRecords = await new Promise((resolve) => {
-                        let whereClause = sentEmailBatch
-                          .map((sentEmail) => {
-                            return `Sent_Email_vod__c = "${sentEmail.ID}" OR`;
-                          })
-                          .join(" ")
-                          .slice(0, -3);
-
-                        com.veeva.clm.queryRecord("Email_Activity_vod__c", fields.Email_Activity_vod__c, whereClause, [], null, (data) => {
-                          if (data.success) {
-                            resolve(data.Email_Activity_vod__c);
-                          } else {
-                            util.log(`interactionSummary.api.generateDataModel: failed to retrieve Email_Activity_vod__c records for batch ${data.message}`, "error");
-                            resolve([]);
-                          }
-                        });
-                      });
+                      let result = await crm.query("emailActivity", fields.emailActivity, [{ field: "sentEmailId", value: sentEmailBatch.map((sentEmail) => sentEmail.id) }]);
+                      if (!result.success) util.log(`interactionSummary.api.generateDataModel: failed to retrieve email activity records for batch ${result.message}`, "error");
 
                       // Append batch results to main emailActivityRecords array
-                      emailActivityRecords = emailActivityRecords.concat(batchEmailActivityRecords);
+                      emailActivityRecords = emailActivityRecords.concat(result.records);
                     }
                   }
 
-                  if (emailActivityRecords) {
-                    input.Email_Activity_vod__c = emailActivityRecords;
-                  }
+                  input.emailActivities = emailActivityRecords;
                 }
               }
             }
@@ -9635,9 +10117,10 @@ const interactionSummary = {
                   const timeLineTemplate = outputRecord.timeline.splice(0)[0];
 
                   //call records to add CLM views to timeline
-                  input.Call2_vod__c.filter((call) => call.Account_vod__c == outputRecord.account.id) //filter by account
+                  input.calls.filter((call) => call.accountId == outputRecord.account.id) //filter by account
                     .forEach((call) => {
-                      if (!call.Status_vod__c == "Submitted_vod") return; //only submitted calls
+                      //submitted calls, plus saved calls when considerSavedCalls is on
+                      if (call.status != "submitted" && !(options.considerSavedCalls && call.status == "saved")) return;
 
                       let record = JSON.parse(JSON.stringify(timeLineTemplate));
 
@@ -9645,26 +10128,17 @@ const interactionSummary = {
                       delete record.email;
 
                       //set type and channel
-                      record.id = call.ID;
+                      record.id = call.id;
                       record.type = "call";
-                      record.call.channel = call.Call_Channel_vod__c;
-                      record.call.status = call.Status_vod__c;
-                      record.call.presentations = call.Presentations;
+                      record.call.channel = call.channel;
+                      record.call.status = call.status;
+                      record.call.presentations = call.presentations;
 
                       //set date
-                      let tmpDate = call.Call_Datetime_vod__c;
+                      let tmpDate = call.datetime;
                       let recordDate, recordTime, recordAMPM;
                       if (tmpDate) {
-                        if (tmpDate.indexOf("T") > 0) {
-                          recordDate = tmpDate.split("T")[0];
-                          let tmpHour = parseInt(tmpDate.split("T")[1].split(":")[0]);
-                          if (tmpHour > 12) {
-                            recordTime = tmpHour - 12 + ":" + tmpDate.split("T")[1].split(":").slice(1, 2).join(":");
-                          } else {
-                            recordTime = tmpHour + ":" + tmpDate.split("T")[1].split(":").slice(1, 2).join(":");
-                          }
-                          recordAMPM = tmpHour >= 12 ? "PM" : "AM";
-                        }
+                        ({ date: recordDate, time: recordTime, time_AMPM: recordAMPM } = interactionSummary.localDateTime(tmpDate));
                       }
                       record.datetime = tmpDate;
                       record.date = recordDate;
@@ -9673,17 +10147,17 @@ const interactionSummary = {
 
                       //slides (call key message records for current call)
                       let slideTemplate = record.call.slides.splice(0)[0];
-                      input.Call2_Key_Message_vod__c.filter((callKeyMessage) => callKeyMessage.Call2_vod__c == call.ID) //call key message records for current call
-                        .sort((a, b) => a.Display_Order_vod__c - b.Display_Order_vod__c) //sort by display order
+                      input.callKeyMessages.filter((callKeyMessage) => callKeyMessage.callId == call.id) //call key message records for current call
+                        .sort((a, b) => a.displayOrder - b.displayOrder) //sort by display order
                         .forEach((callKeyMessage) => {
                           let slideRecord = JSON.parse(JSON.stringify(slideTemplate));
 
                           //search slide in config.js
                           let slide;
-                          if (callKeyMessage.Key_Message_vod__c.testModel) {
-                            slide = vars.slides.find((slide) => slide.id == callKeyMessage.Key_Message_vod__c.testModel.slideId); //testModel workaround as slides will still no have media file name
+                          if (callKeyMessage.keyMessage.testModel) {
+                            slide = vars.slides.find((slide) => slide.id == callKeyMessage.keyMessage.testModel.slideId); //testModel workaround as slides will still no have media file name
                           } else {
-                            slide = vars.slides.find((slide) => slide.player.zipName == callKeyMessage.Key_Message_vod__c.Media_File_Name_vod__c);
+                            slide = vars.slides.find((slide) => slide.player.zipName == callKeyMessage.keyMessage.mediaFileName);
                           }
 
                           //populate slide record
@@ -9693,13 +10167,13 @@ const interactionSummary = {
                           } else {
                             //if not this IVA slide, use values from key message record
                             slideRecord.doesNotBelongToThisIVA = true;
-                            slideRecord.id = callKeyMessage.Key_Message_vod__c.id;
-                            slideRecord.title = callKeyMessage.Key_Message_vod__c.Key_Message_Name_vod__c;
+                            slideRecord.id = callKeyMessage.keyMessage.id;
+                            slideRecord.title = callKeyMessage.keyMessage.name;
                           }
 
-                          slideRecord.displayOrder = callKeyMessage.Display_Order_vod__c;
-                          slideRecord.duration = Math.round(callKeyMessage.Duration_vod__c);
-                          slideRecord.reaction = callKeyMessage.Reaction_vod__c;
+                          slideRecord.displayOrder = callKeyMessage.displayOrder;
+                          slideRecord.duration = Math.round(callKeyMessage.duration);
+                          slideRecord.reaction = callKeyMessage.reaction;
 
                           //add to array
                           record.call.slides.push(slideRecord);
@@ -9729,9 +10203,9 @@ const interactionSummary = {
                     });
 
                   //email records
-                  input.Sent_Email_vod__c.filter((sentEmail) => sentEmail.Account_vod__c == outputRecord.account.id) //filter by account
+                  input.sentEmails.filter((sentEmail) => sentEmail.accountId == outputRecord.account.id) //filter by account
                     .forEach((sentEmail) => {
-                      if (!sentEmail.Email_Sent_Date_vod__c) return; //only sent emails (no saved)
+                      if (!sentEmail.sentDate) return; //only sent emails (no saved)
 
                       let record = JSON.parse(JSON.stringify(timeLineTemplate));
 
@@ -9739,22 +10213,13 @@ const interactionSummary = {
                       delete record.call;
 
                       //set type
-                      record.id = sentEmail.ID;
+                      record.id = sentEmail.id;
                       record.type = "email";
 
                       //set date
-                      let tmpDate = sentEmail.Email_Sent_Date_vod__c;
+                      let tmpDate = sentEmail.sentDate;
                       let recordDate, recordTime, recordAMPM;
-                      if (tmpDate.indexOf("T") > 0) {
-                        recordDate = tmpDate.split("T")[0];
-                        let tmpHour = parseInt(tmpDate.split("T")[1].split(":")[0]);
-                        if (tmpHour > 12) {
-                          recordTime = tmpHour - 12 + ":" + tmpDate.split("T")[1].split(":").slice(1, 2).join(":");
-                        } else {
-                          recordTime = tmpHour + ":" + tmpDate.split("T")[1].split(":").slice(1, 2).join(":");
-                        }
-                        recordAMPM = tmpHour >= 12 ? "PM" : "AM";
-                      }
+                      ({ date: recordDate, time: recordTime, time_AMPM: recordAMPM } = interactionSummary.localDateTime(tmpDate));
                       record.datetime = tmpDate;
                       record.date = recordDate;
                       record.time = recordTime;
@@ -9765,17 +10230,17 @@ const interactionSummary = {
                       {
                         //try to find in email cart templates
                         if (vars.emailCart.active) {
-                          template = vars.emailCart.templates.find((template) => template.crmId == sentEmail.Approved_Email_Template_vod__c);
+                          template = vars.emailCart.templates.find((template) => template.crmId == sentEmail.emailTemplateId);
                           if (template) templateType = "emailCart";
                         }
                         //try to find in non email cart templates
                         if (!template) {
-                          template = nonEmailCartItems.templates.find((template) => template.crmId == sentEmail.Approved_Email_Template_vod__c);
+                          template = nonEmailCartItems.templates.find((template) => template.crmId == sentEmail.emailTemplateId);
                           if (template) templateType = "nonEmailCartItems";
                         }
                         //try to find in rteBuilder templates
                         if (!template && vars.rteBuilder.active) {
-                          template = vars.rteBuilder.templates.find((template) => template.crmId == sentEmail.Approved_Email_Template_vod__c);
+                          template = vars.rteBuilder.templates.find((template) => template.crmId == sentEmail.emailTemplateId);
                           if (template) templateType = "rteBuilder";
                         }
                         if (!template) return;
@@ -9784,14 +10249,14 @@ const interactionSummary = {
                       //populate template record
                       record.email.id = template.id;
                       record.email.title = template.title;
-                      record.email.opens = sentEmail.Open_Count_vod__c;
+                      record.email.opens = sentEmail.openCount;
                       record.email.clicks = 0;
 
                       //fragments
                       let fragmentTemplate = record.email.fragments.splice(0)[0];
 
-                      if (sentEmail.Email_Fragments_vod__c) {
-                        let fragmentIDs = sentEmail.Email_Fragments_vod__c.split(",");
+                      if (sentEmail.emailFragments) {
+                        let fragmentIDs = sentEmail.emailFragments.split(",");
                         fragmentIDs.forEach((fragmentID) => {
                           //search fragment
                           let fragment;
@@ -9821,11 +10286,11 @@ const interactionSummary = {
                           }
                           fragmentRecord.clicks = 0;
 
-                          input.Email_Activity_vod__c.filter(
-                            (emailActivity) => emailActivity.Sent_Email_vod__c == sentEmail.ID && emailActivity.Approved_Document_vod__c == fragment.crmId,
+                          input.emailActivities.filter(
+                            (emailActivity) => emailActivity.sentEmailId == sentEmail.id && emailActivity.approvedDocumentId == fragment.crmId,
                           ).forEach((emailActivity) => {
-                            if (!emailActivity.Approved_Document_vod__c) return; //only events for approved documents (email fragments)
-                            if (emailActivity.Event_type_vod__c != "Clicked_vod") return; //only click events
+                            if (!emailActivity.approvedDocumentId) return; //only events for approved documents (email fragments)
+                            if (emailActivity.eventType != "clicked") return; //only click events
 
                             //increment fragment clicks
                             fragmentRecord.clicks++;
@@ -9861,44 +10326,35 @@ const interactionSummary = {
                     record.title = slide.description;
 
                     //search call key message records for this slide
-                    let callKeyMessageRecords = input.Call2_Key_Message_vod__c.filter((callKeyMessage) => {
+                    let callKeyMessageRecords = input.callKeyMessages.filter((callKeyMessage) => {
                       //filter by account
-                      return callKeyMessage.Account_vod__c == outputRecord.account.id;
+                      return callKeyMessage.accountId == outputRecord.account.id;
                     })
                       .filter(function (callKeyMessage) {
                         //filter by slide / media file name
-                        if (callKeyMessage.Key_Message_vod__c.testModel) {
-                          return callKeyMessage.Key_Message_vod__c.testModel.slideId == slide.id;
+                        if (callKeyMessage.keyMessage.testModel) {
+                          return callKeyMessage.keyMessage.testModel.slideId == slide.id;
                         } else {
-                          return callKeyMessage.Key_Message_vod__c.Media_File_Name_vod__c == slide.player.zipName;
+                          return callKeyMessage.keyMessage.mediaFileName == slide.player.zipName;
                         }
                       })
-                      .filter((callKeyMessage) => input.Call2_vod__c.find((call) => call.ID == callKeyMessage.Call2_vod__c)) // filter by existing calls
-                      .sort((a, b) => new Date(b.Start_Time_vod__c) - new Date(a.Start_Time_vod__c)); //sort by start time
+                      .filter((callKeyMessage) => input.calls.find((call) => call.id == callKeyMessage.callId)) // filter by existing calls
+                      .sort((a, b) => new Date(b.startTime) - new Date(a.startTime)); //sort by start time
 
                     //discussed/not discussed and mostRecentCall info
                     if (callKeyMessageRecords.length > 0) {
                       record.status = "discussed";
 
-                      let tmpDate = callKeyMessageRecords[0].Start_Time_vod__c;
+                      let tmpDate = callKeyMessageRecords[0].startTime;
                       let recordDate, recordTime, recordAMPM;
                       if (tmpDate) {
-                        if (tmpDate.indexOf("T") > 0) {
-                          recordDate = tmpDate.split("T")[0];
-                          let tmpHour = parseInt(tmpDate.split("T")[1].split(":")[0]);
-                          if (tmpHour > 12) {
-                            recordTime = tmpHour - 12 + ":" + tmpDate.split("T")[1].split(":").slice(1, 2).join(":");
-                          } else {
-                            recordTime = tmpHour + ":" + tmpDate.split("T")[1].split(":").slice(1, 2).join(":");
-                          }
-                          recordAMPM = tmpHour >= 12 ? "PM" : "AM";
-                        }
+                        ({ date: recordDate, time: recordTime, time_AMPM: recordAMPM } = interactionSummary.localDateTime(tmpDate));
                       }
                       record.mostRecentCall.date = recordDate;
                       record.mostRecentCall.time = recordTime;
                       record.mostRecentCall.time_AMPM = recordAMPM;
-                      record.mostRecentCall.duration = Math.round(callKeyMessageRecords[0].Duration_vod__c);
-                      record.mostRecentCall.reaction = callKeyMessageRecords[0].Reaction_vod__c;
+                      record.mostRecentCall.duration = Math.round(callKeyMessageRecords[0].duration);
+                      record.mostRecentCall.reaction = callKeyMessageRecords[0].reaction;
                     } else {
                       record.status = "notDiscussed";
                     }
@@ -9906,17 +10362,17 @@ const interactionSummary = {
                     //overal duration and reaction
                     record.overall.timesDisplayed = callKeyMessageRecords.length;
                     record.overall.duration.total = callKeyMessageRecords.reduce((acc, callKeyMessage) => {
-                      return acc + callKeyMessage.Duration_vod__c;
+                      return acc + callKeyMessage.duration;
                     }, 0);
                     record.overall.duration.average = record.overall.timesDisplayed > 0 ? record.overall.duration.total / record.overall.timesDisplayed : 0;
                     record.overall.reaction.positive = callKeyMessageRecords.reduce((acc, callKeyMessage) => {
-                      return callKeyMessage.Reaction_vod__c == "Positive" ? acc + 1 : acc;
+                      return callKeyMessage.reaction == "positive" ? acc + 1 : acc;
                     }, 0);
                     record.overall.reaction.neutral = callKeyMessageRecords.reduce((acc, callKeyMessage) => {
-                      return callKeyMessage.Reaction_vod__c == "Neutral" ? acc + 1 : acc;
+                      return callKeyMessage.reaction == "neutral" ? acc + 1 : acc;
                     }, 0);
                     record.overall.reaction.negative = callKeyMessageRecords.reduce((acc, callKeyMessage) => {
-                      return callKeyMessage.Reaction_vod__c == "Negative" ? acc + 1 : acc;
+                      return callKeyMessage.reaction == "negative" ? acc + 1 : acc;
                     }, 0);
 
                     //round numbers
@@ -9924,7 +10380,7 @@ const interactionSummary = {
                     record.overall.duration.average = Math.round(record.overall.duration.average);
 
                     //all call dates
-                    record.overall.callDates = callKeyMessageRecords.map((callKeyMessage) => callKeyMessage.Start_Time_vod__c);
+                    record.overall.callDates = callKeyMessageRecords.map((callKeyMessage) => callKeyMessage.startTime);
 
                     //add to array
                     outputRecord.slides.push(record);
@@ -10033,9 +10489,9 @@ const interactionSummary = {
                   //activity
                   outputRecord.emails.forEach((email) => {
                     //sent emails for this template
-                    let sentEmails = input.Sent_Email_vod__c.filter((sentEmail) => sentEmail.Account_vod__c == outputRecord.account.id) //filter by account
-                      .sort((a, b) => new Date(b.Email_Sent_Date_vod__c) - new Date(a.Email_Sent_Date_vod__c))
-                      .filter((sentEmail) => sentEmail.Approved_Email_Template_vod__c == email.crmId && sentEmail.Email_Sent_Date_vod__c);
+                    let sentEmails = input.sentEmails.filter((sentEmail) => sentEmail.accountId == outputRecord.account.id) //filter by account
+                      .sort((a, b) => new Date(b.sentDate) - new Date(a.sentDate))
+                      .filter((sentEmail) => sentEmail.emailTemplateId == email.crmId && sentEmail.sentDate);
 
                     //status: sent/not sent
                     if (sentEmails.length > 0) {
@@ -10050,71 +10506,53 @@ const interactionSummary = {
                       mostRecentEmail = sentEmails[0];
                     }
                     if (mostRecentEmail) {
-                      email.mostRecentSent.sentEmailID = mostRecentEmail.ID;
+                      email.mostRecentSent.sentEmailID = mostRecentEmail.id;
 
-                      let tmpDate = mostRecentEmail.Email_Sent_Date_vod__c;
+                      let tmpDate = mostRecentEmail.sentDate;
                       let recordDate, recordTime, recordAMPM;
-                      if (tmpDate.indexOf("T") > 0) {
-                        recordDate = tmpDate.split("T")[0];
-                        let tmpHour = parseInt(tmpDate.split("T")[1].split(":")[0]);
-                        if (tmpHour > 12) {
-                          recordTime = tmpHour - 12 + ":" + tmpDate.split("T")[1].split(":").slice(1, 2).join(":");
-                        } else {
-                          recordTime = tmpHour + ":" + tmpDate.split("T")[1].split(":").slice(1, 2).join(":");
-                        }
-                        recordAMPM = tmpHour >= 12 ? "PM" : "AM";
-                      }
+                      ({ date: recordDate, time: recordTime, time_AMPM: recordAMPM } = interactionSummary.localDateTime(tmpDate));
                       email.mostRecentSent.date = recordDate;
                       email.mostRecentSent.time = recordTime;
                       email.mostRecentSent.time_AMPM = recordAMPM;
 
-                      email.mostRecentSent.opens = mostRecentEmail.Open_Count_vod__c;
-                      email.mostRecentSent.clicks = mostRecentEmail.Click_Count_vod__c;
+                      email.mostRecentSent.opens = mostRecentEmail.openCount;
+                      email.mostRecentSent.clicks = mostRecentEmail.clickCount;
                     }
 
                     //most recent open email
                     let mostRecentOpen;
                     if (sentEmails.length > 0) {
-                      mostRecentOpen = sentEmails.find((sentEmail) => sentEmail.Opened_vod__c);
+                      mostRecentOpen = sentEmails.find((sentEmail) => sentEmail.opened);
                     }
                     if (mostRecentOpen) {
-                      email.mostRecentOpen.sentEmailID = mostRecentOpen.ID;
+                      email.mostRecentOpen.sentEmailID = mostRecentOpen.id;
 
-                      let tmpDate = mostRecentOpen.Email_Sent_Date_vod__c;
+                      let tmpDate = mostRecentOpen.sentDate;
                       let recordDate, recordTime, recordAMPM;
-                      if (tmpDate.indexOf("T") > 0) {
-                        recordDate = tmpDate.split("T")[0];
-                        let tmpHour = parseInt(tmpDate.split("T")[1].split(":")[0]);
-                        if (tmpHour > 12) {
-                          recordTime = tmpHour - 12 + ":" + tmpDate.split("T")[1].split(":").slice(1, 2).join(":");
-                        } else {
-                          recordTime = tmpHour + ":" + tmpDate.split("T")[1].split(":").slice(1, 2).join(":");
-                        }
-                        recordAMPM = tmpHour >= 12 ? "PM" : "AM";
-                      }
+                      ({ date: recordDate, time: recordTime, time_AMPM: recordAMPM } = interactionSummary.localDateTime(tmpDate));
                       email.mostRecentOpen.date = recordDate;
                       email.mostRecentOpen.time = recordTime;
                       email.mostRecentOpen.time_AMPM = recordAMPM;
 
-                      email.mostRecentOpen.clicks = mostRecentOpen.Click_Count_vod__c;
+                      email.mostRecentOpen.clicks = mostRecentOpen.clickCount;
                     }
 
                     //overall
                     email.overall.sent = sentEmails.length;
-                    email.overall.sentDates = sentEmails.map((sentEmail) => sentEmail.Email_Sent_Date_vod__c);
+                    email.overall.sentDates = sentEmails.map((sentEmail) => sentEmail.sentDate);
                     email.overall.opens = sentEmails.reduce((acc, sentEmail) => {
-                      return acc + sentEmail.Open_Count_vod__c;
+                      return acc + sentEmail.openCount;
                     }, 0);
-                    email.overall.openDates = sentEmails.filter((sentEmail) => sentEmail.Opened_vod__c).map((sentEmail) => sentEmail.Email_Sent_Date_vod__c);
+                    email.overall.openDates = sentEmails.filter((sentEmail) => sentEmail.opened).map((sentEmail) => sentEmail.sentDate);
                     email.overall.clicks = sentEmails.reduce((acc, sentEmail) => {
-                      return acc + sentEmail.Click_Count_vod__c;
+                      return acc + sentEmail.clickCount;
                     }, 0);
 
                     email.fragments.forEach((fragment) => {
                       //sent emails for this fragment
                       let sentEmailsForThisFragment = sentEmails
-                        .filter((sentEmail) => sentEmail.Account_vod__c == outputRecord.account.id) //filter by account
-                        .filter((sentEmail) => sentEmail.Email_Fragments_vod__c && sentEmail.Email_Fragments_vod__c.indexOf(fragment.crmId) > -1);
+                        .filter((sentEmail) => sentEmail.accountId == outputRecord.account.id) //filter by account
+                        .filter((sentEmail) => sentEmail.emailFragments && sentEmail.emailFragments.indexOf(fragment.crmId) > -1);
 
                       if (sentEmailsForThisFragment.length > 0) {
                         fragment.status = "sent";
@@ -10128,20 +10566,11 @@ const interactionSummary = {
                         mostRecentEmailForFragment = sentEmailsForThisFragment[0];
                       }
                       if (mostRecentEmailForFragment) {
-                        fragment.mostRecentSent.sentEmailID = mostRecentEmailForFragment.ID;
+                        fragment.mostRecentSent.sentEmailID = mostRecentEmailForFragment.id;
 
-                        let tmpDate = mostRecentEmailForFragment.Email_Sent_Date_vod__c;
+                        let tmpDate = mostRecentEmailForFragment.sentDate;
                         let recordDate, recordTime, recordAMPM;
-                        if (tmpDate.indexOf("T") > 0) {
-                          recordDate = tmpDate.split("T")[0];
-                          let tmpHour = parseInt(tmpDate.split("T")[1].split(":")[0]);
-                          if (tmpHour > 12) {
-                            recordTime = tmpHour - 12 + ":" + tmpDate.split("T")[1].split(":").slice(1, 2).join(":");
-                          } else {
-                            recordTime = tmpHour + ":" + tmpDate.split("T")[1].split(":").slice(1, 2).join(":");
-                          }
-                          recordAMPM = tmpHour >= 12 ? "PM" : "AM";
-                        }
+                        ({ date: recordDate, time: recordTime, time_AMPM: recordAMPM } = interactionSummary.localDateTime(tmpDate));
                         fragment.mostRecentSent.date = recordDate;
                         fragment.mostRecentSent.time = recordTime;
                         fragment.mostRecentSent.time_AMPM = recordAMPM;
@@ -10151,11 +10580,11 @@ const interactionSummary = {
 
                       //clicks count for most recent email
                       if (mostRecentEmailForFragment) {
-                        let clicksCountForMostRecentEmail = input.Email_Activity_vod__c.filter(
+                        let clicksCountForMostRecentEmail = input.emailActivities.filter(
                           (emailActivity) =>
-                            emailActivity.Sent_Email_vod__c == mostRecentEmailForFragment.ID &&
-                            emailActivity.Approved_Document_vod__c == fragment.crmId &&
-                            emailActivity.Event_type_vod__c == "Clicked_vod",
+                            emailActivity.sentEmailId == mostRecentEmailForFragment.id &&
+                            emailActivity.approvedDocumentId == fragment.crmId &&
+                            emailActivity.eventType == "clicked",
                         ).length;
                         fragment.mostRecentSent.clicks = clicksCountForMostRecentEmail;
                       }
@@ -10164,13 +10593,13 @@ const interactionSummary = {
                       let mostRecentEmailWithClicksForFragment;
                       if (sentEmailsForThisFragment.length > 0) {
                         mostRecentEmailWithClicksForFragment = sentEmailsForThisFragment
-                          .sort((a, b) => new Date(b.Email_Sent_Date_vod__c) - new Date(a.Email_Sent_Date_vod__c))
+                          .sort((a, b) => new Date(b.sentDate) - new Date(a.sentDate))
                           .find((sentEmail) => {
-                            return input.Email_Activity_vod__c.sort((a, b) => new Date(b.Activity_DateTime_vod__c) - new Date(a.Activity_DateTime_vod__c)).find(
+                            return input.emailActivities.sort((a, b) => new Date(b.activityDatetime) - new Date(a.activityDatetime)).find(
                               (emailActivity) =>
-                                emailActivity.Sent_Email_vod__c == sentEmail.ID &&
-                                emailActivity.Approved_Document_vod__c == fragment.crmId &&
-                                emailActivity.Event_type_vod__c == "Clicked_vod",
+                                emailActivity.sentEmailId == sentEmail.id &&
+                                emailActivity.approvedDocumentId == fragment.crmId &&
+                                emailActivity.eventType == "clicked",
                             );
                           });
                       }
@@ -10178,56 +10607,47 @@ const interactionSummary = {
                       //most recent activity for fragment
                       let mostRecentEmailActivityForFragment;
                       if (mostRecentEmailWithClicksForFragment) {
-                        mostRecentEmailActivityForFragment = input.Email_Activity_vod__c.sort(
-                          (a, b) => new Date(b.Activity_DateTime_vod__c) - new Date(a.Activity_DateTime_vod__c),
+                        mostRecentEmailActivityForFragment = input.emailActivities.sort(
+                          (a, b) => new Date(b.activityDatetime) - new Date(a.activityDatetime),
                         ).find(
                           (emailActivity) =>
-                            emailActivity.Sent_Email_vod__c == mostRecentEmailWithClicksForFragment.ID &&
-                            emailActivity.Approved_Document_vod__c == fragment.crmId &&
-                            emailActivity.Event_type_vod__c == "Clicked_vod",
+                            emailActivity.sentEmailId == mostRecentEmailWithClicksForFragment.id &&
+                            emailActivity.approvedDocumentId == fragment.crmId &&
+                            emailActivity.eventType == "clicked",
                         );
                       }
 
                       //most recent click
                       if (mostRecentEmailWithClicksForFragment && mostRecentEmailActivityForFragment) {
-                        fragment.mostRecentClick.sentEmailID = mostRecentEmailWithClicksForFragment.ID;
+                        fragment.mostRecentClick.sentEmailID = mostRecentEmailWithClicksForFragment.id;
 
-                        let tmpDate = mostRecentEmailActivityForFragment.Activity_DateTime_vod__c;
+                        let tmpDate = mostRecentEmailActivityForFragment.activityDatetime;
                         let recordDate, recordTime, recordAMPM;
                         if (tmpDate) {
-                          if (tmpDate.indexOf("T") > 0) {
-                            recordDate = tmpDate.split("T")[0];
-                            let tmpHour = parseInt(tmpDate.split("T")[1].split(":")[0]);
-                            if (tmpHour > 12) {
-                              recordTime = tmpHour - 12 + ":" + tmpDate.split("T")[1].split(":").slice(1, 2).join(":");
-                            } else {
-                              recordTime = tmpHour + ":" + tmpDate.split("T")[1].split(":").slice(1, 2).join(":");
-                            }
-                            recordAMPM = tmpHour >= 12 ? "PM" : "AM";
-                          }
+                          ({ date: recordDate, time: recordTime, time_AMPM: recordAMPM } = interactionSummary.localDateTime(tmpDate));
                         }
                         fragment.mostRecentClick.date = recordDate;
                         fragment.mostRecentClick.time = recordTime;
                         fragment.mostRecentClick.time_AMPM = recordAMPM;
 
-                        fragment.mostRecentClick.emailActivityID = mostRecentEmailActivityForFragment.ID;
+                        fragment.mostRecentClick.emailActivityID = mostRecentEmailActivityForFragment.id;
                       }
 
                       //overall
                       fragment.overall.sent = sentEmailsForThisFragment.length;
-                      fragment.overall.sentDates = sentEmailsForThisFragment.map((sentEmail) => sentEmail.Email_Sent_Date_vod__c);
-                      fragment.overall.clicks = input.Email_Activity_vod__c.filter(
+                      fragment.overall.sentDates = sentEmailsForThisFragment.map((sentEmail) => sentEmail.sentDate);
+                      fragment.overall.clicks = input.emailActivities.filter(
                         (emailActivity) =>
-                          sentEmailsForThisFragment.find((sentEmail) => sentEmail.ID == emailActivity.Sent_Email_vod__c) &&
-                          emailActivity.Approved_Document_vod__c == fragment.crmId &&
-                          emailActivity.Event_type_vod__c == "Clicked_vod",
+                          sentEmailsForThisFragment.find((sentEmail) => sentEmail.id == emailActivity.sentEmailId) &&
+                          emailActivity.approvedDocumentId == fragment.crmId &&
+                          emailActivity.eventType == "clicked",
                       ).length;
-                      fragment.overall.clickDates = input.Email_Activity_vod__c.filter(
+                      fragment.overall.clickDates = input.emailActivities.filter(
                         (emailActivity) =>
-                          sentEmailsForThisFragment.find((sentEmail) => sentEmail.ID == emailActivity.Sent_Email_vod__c) &&
-                          emailActivity.Approved_Document_vod__c == fragment.crmId &&
-                          emailActivity.Event_type_vod__c == "Clicked_vod",
-                      ).map((emailActivity) => emailActivity.Activity_DateTime_vod__c);
+                          sentEmailsForThisFragment.find((sentEmail) => sentEmail.id == emailActivity.sentEmailId) &&
+                          emailActivity.approvedDocumentId == fragment.crmId &&
+                          emailActivity.eventType == "clicked",
+                      ).map((emailActivity) => emailActivity.activityDatetime);
 
                       //remove duplicates
                       fragment.overall.sentDates = [...new Set(fragment.overall.sentDates)];
@@ -10262,11 +10682,11 @@ const interactionSummary = {
                   });
 
                   //populate data from calls and call key message records
-                  input.Call2_vod__c.filter((call) => {
-                    return call.Account_vod__c == outputRecord.account.id;
+                  input.calls.filter((call) => {
+                    return call.accountId == outputRecord.account.id;
                   }) //filter by account
                     .forEach((call) => {
-                      let presentations = call.Presentations || [];
+                      let presentations = call.presentations || [];
                       presentations.forEach((presentation) => {
                         //skip this presentation
                         if (presentation.thisPresentation) return;
@@ -10278,22 +10698,22 @@ const interactionSummary = {
                         let record = outputRecord.relatedCLM[recordIndex];
 
                         //search call key message records for this presentation
-                        let callKeyMessageRecords = input.Call2_Key_Message_vod__c.filter((callKeyMessage) => {
-                          return callKeyMessage.Account_vod__c == outputRecord.account.id;
+                        let callKeyMessageRecords = input.callKeyMessages.filter((callKeyMessage) => {
+                          return callKeyMessage.accountId == outputRecord.account.id;
                         }) // filter by account
                           .filter(function (callKeyMessage) {
-                            return callKeyMessage.Call2_vod__c == call.ID && callKeyMessage.Key_Message_vod__c.presentation == presentation.name;
+                            return callKeyMessage.callId == call.id && callKeyMessage.keyMessage.presentation == presentation.name;
                           }); //only call key message records for this call and presentation
 
                         callKeyMessageRecords.forEach((callKeyMessage) => {
                           //zip file record for this key message
                           let zipFileIndex = record.zipFiles.findIndex((zipFile) => {
-                            return zipFile.name == callKeyMessage.Key_Message_vod__c.Media_File_Name_vod__c;
+                            return zipFile.name == callKeyMessage.keyMessage.mediaFileName;
                           });
                           if (zipFileIndex < 0) {
                             let newZipFileRecord = JSON.parse(JSON.stringify(zipFileTemplate));
-                            newZipFileRecord.name = callKeyMessage.Key_Message_vod__c.Key_Message_Name_vod__c;
-                            newZipFileRecord.zip = callKeyMessage.Key_Message_vod__c.Media_File_Name_vod__c;
+                            newZipFileRecord.name = callKeyMessage.keyMessage.name;
+                            newZipFileRecord.zip = callKeyMessage.keyMessage.mediaFileName;
                             newZipFileRecord.overall.timesDisplayed = 0;
                             record.zipFiles.push(newZipFileRecord);
                             zipFileIndex = record.zipFiles.length - 1;
@@ -10302,34 +10722,26 @@ const interactionSummary = {
                           let zipFileRecord = record.zipFiles[zipFileIndex];
 
                           //most recent call date
-                          if (!zipFileRecord.mostRecentCall.date || new Date(callKeyMessage.Start_Time_vod__c) > new Date(zipFileRecord.mostRecentCall.date)) {
-                            zipFileRecord.mostRecentCall.date = callKeyMessage.Start_Time_vod__c;
-                            zipFileRecord.mostRecentCall.duration = Math.round(callKeyMessage.Duration_vod__c);
-                            zipFileRecord.mostRecentCall.reaction = callKeyMessage.Reaction_vod__c;
+                          if (!zipFileRecord.mostRecentCall.date || new Date(callKeyMessage.startTime) > new Date(zipFileRecord.mostRecentCall.date)) {
+                            zipFileRecord.mostRecentCall.date = callKeyMessage.startTime;
+                            zipFileRecord.mostRecentCall.duration = Math.round(callKeyMessage.duration);
+                            zipFileRecord.mostRecentCall.reaction = callKeyMessage.reaction;
                           }
 
                           //overall
                           zipFileRecord.overall.timesDisplayed++;
-                          if (zipFileRecord.overall.allCallDates.indexOf(callKeyMessage.Start_Time_vod__c) < 0) {
-                            zipFileRecord.overall.allCallDates.push(callKeyMessage.Start_Time_vod__c);
+                          if (zipFileRecord.overall.allCallDates.indexOf(callKeyMessage.startTime) < 0) {
+                            zipFileRecord.overall.allCallDates.push(callKeyMessage.startTime);
                           }
                         });
 
                         //most recent call date for presentation
-                        if (!record.mostRecentCall.date || new Date(call.Call_Datetime_vod__c) > new Date(record.mostRecentCall.date)) {
-                          let tmpDate = call.Call_Datetime_vod__c;
+                        if (!record.mostRecentCall.datetime || new Date(call.datetime) > new Date(record.mostRecentCall.datetime)) {
+                          let tmpDate = call.datetime;
+                          record.mostRecentCall.datetime = tmpDate;
                           let recordDate, recordTime, recordAMPM;
                           if (tmpDate) {
-                            if (tmpDate.indexOf("T") > 0) {
-                              recordDate = tmpDate.split("T")[0];
-                              let tmpHour = parseInt(tmpDate.split("T")[1].split(":")[0]);
-                              if (tmpHour > 12) {
-                                recordTime = tmpHour - 12 + ":" + tmpDate.split("T")[1].split(":").slice(1, 2).join(":");
-                              } else {
-                                recordTime = tmpHour + ":" + tmpDate.split("T")[1].split(":").slice(1, 2).join(":");
-                              }
-                              recordAMPM = tmpHour >= 12 ? "PM" : "AM";
-                            }
+                            ({ date: recordDate, time: recordTime, time_AMPM: recordAMPM } = interactionSummary.localDateTime(tmpDate));
                           }
                           record.mostRecentCall.date = recordDate;
                           record.mostRecentCall.time = recordTime;
@@ -10338,8 +10750,8 @@ const interactionSummary = {
 
                         //overall for presentation
                         record.overall.timesDisplayed++;
-                        if (record.overall.allCallDates.indexOf(call.Call_Datetime_vod__c) < 0) {
-                          record.overall.allCallDates.push(call.Call_Datetime_vod__c);
+                        if (record.overall.allCallDates.indexOf(call.datetime) < 0) {
+                          record.overall.allCallDates.push(call.datetime);
                         }
                       });
                     });
@@ -10385,16 +10797,16 @@ const interactionSummary = {
                   thisWeeksSaturday.setDate(thisWeeksSaturday.getDate() + 5); // Mon + 5 = Sat; week is Mon–Fri only
                   thisWeeksSaturday.setHours(0, 0, 0, 0);
                   
-                  // Check Planned_Call2_vod__c array for planned calls Mon–Fri
-                  input.Planned_Call2_vod__c.filter((call) => call.Account_vod__c == outputRecord.account.id) //filter by account
+                  // Check plannedCalls array for planned calls Mon–Fri
+                  input.plannedCalls.filter((call) => call.accountId == outputRecord.account.id) //filter by account
                     .forEach((call) => {
-                      let callDate = new Date(call.Call_Datetime_vod__c);
+                      let callDate = new Date(call.datetime);
                       if (callDate > thisWeeksMonday && callDate < thisWeeksSaturday) {
                         outputRecord.account.flags.visitingThisWeek = true;
                         let hours = callDate.getHours();
                         let minutes = String(callDate.getMinutes()).padStart(2, "0");
                         outputRecord.account.scheduledCalls.push({
-                          datetime: call.Call_Datetime_vod__c,
+                          datetime: call.datetime,
                           date: `${callDate.getFullYear()}-${String(callDate.getMonth() + 1).padStart(2, "0")}-${String(callDate.getDate()).padStart(2, "0")}`,
                           time: `${hours % 12 || 12}:${minutes}`,
                           time_AMPM: hours < 12 ? "AM" : "PM",
@@ -10620,10 +11032,10 @@ const interactionSummary = {
             let idString = "00000000000000000".substring(0, 17 - consecutiveNumber.toString().length) + consecutiveNumber;
 
             pseudoKeyMessagesMatrix.push({
-              Presentation: labels.accountView.thisPresentation,
-              ID: idString,
-              Media_File_Name_vod__c: labels.accountView.thisPresentation.replaceAll(" ", "") + "_" + slide.id + ".zip",
-              ThisPresentation: true,
+              presentation: labels.accountView.thisPresentation,
+              id: idString,
+              mediaFileName: labels.accountView.thisPresentation.replaceAll(" ", "") + "_" + slide.id + ".zip",
+              thisPresentation: true,
               slideIdInConfig: slide.id,
             });
           });
@@ -10636,10 +11048,10 @@ const interactionSummary = {
               let consecutiveNumber = pseudoKeyMessagesMatrix.length + 2;
               let idString = "00000000000000000".substring(0, 17 - consecutiveNumber.toString().length) + consecutiveNumber;
               pseudoKeyMessagesMatrix.push({
-                Presentation: clm.name,
-                ID: idString,
-                Media_File_Name_vod__c: clm.name.replaceAll(" ", "") + "_Slide" + (i + 1) + ".zip",
-                ThisPresentation: false,
+                presentation: clm.name,
+                id: idString,
+                mediaFileName: clm.name.replaceAll(" ", "") + "_Slide" + (i + 1) + ".zip",
+                thisPresentation: false,
               });
             }
           });
@@ -10663,9 +11075,9 @@ const interactionSummary = {
         });
       }
 
-      //Call2_vod__c
-      let Call2_vod__c = [];
-      let Call2_vod__c_Counter = 0;
+      //calls
+      let calls = [];
+      let callCounter = 0;
 
       accounts.forEach((account) => {
         if (account.doNotGenerateTestData) return;
@@ -10679,14 +11091,14 @@ const interactionSummary = {
           callDate.setDate(callDate.getDate() - Math.floor(Math.random() * 30));
 
           //channel
-          let callChannel = Math.random() < 0.5 ? "Video_vod" : "Face_to_face_vod";
+          let callChannel = Math.random() < 0.5 ? "video" : "faceToFace";
 
           //status
           let statusForThisCall;
           if (options.considerSavedCalls) {
-            statusForThisCall = random < 0.5 ? "Submitted_vod" : random < 0.9 ? "Planned_vod" : "Saved_vod";
+            statusForThisCall = random < 0.5 ? "submitted" : random < 0.9 ? "planned" : "saved";
           } else {
-            statusForThisCall = random < 0.7 ? "Submitted_vod" : "Planned_vod";
+            statusForThisCall = random < 0.7 ? "submitted" : "planned";
           }
 
           //presentations for this call
@@ -10697,85 +11109,85 @@ const interactionSummary = {
           while (presentationsForThisCall.length < presentionsCountForThisCall && attempts < 20) {
             attempts++;
             let presentation = pseudoKeyMessagesMatrix[Math.floor(Math.random() * pseudoKeyMessagesMatrix.length)];
-            if (presentationsForThisCall.findIndex((item) => item.name == presentation.Presentation) < 0) {
+            if (presentationsForThisCall.findIndex((item) => item.name == presentation.presentation) < 0) {
               presentationsForThisCall.push({
-                name: presentation.Presentation,
-                thisPresentation: presentation.ThisPresentation,
+                name: presentation.presentation,
+                thisPresentation: presentation.thisPresentation,
               });
             }
           }
 
-          let Call2_vod__c_Record = {
-            ID: "0000000000000000" + (Call2_vod__c_Counter + 10),
-            Account_vod__c: account.id,
-            Call_Channel_vod__c: callChannel,
-            Call_Datetime_vod__c: callDate.toISOString(),
-            Status_vod__c: statusForThisCall,
-            Presentations: presentationsForThisCall,
+          let callRecord = {
+            id: "0000000000000000" + (callCounter + 10),
+            accountId: account.id,
+            channel: callChannel,
+            datetime: callDate.toISOString(),
+            status: statusForThisCall,
+            presentations: presentationsForThisCall,
           };
 
-          Call2_vod__c.push(Call2_vod__c_Record);
+          calls.push(callRecord);
 
-          Call2_vod__c_Counter++;
+          callCounter++;
         }
         //remove fields not set in config
-        Call2_vod__c.forEach((record) => {
+        calls.forEach((record) => {
           Object.keys(record).forEach((field) => {
-            if (field == "Presentations") return; //keep Presentations
-            if (fields.Call2_vod__c.indexOf(field) < 0) {
+            if (field == "presentations") return; //keep Presentations
+            if (fields.call.indexOf(field) < 0) {
               delete record[field];
             }
           });
         });
       });
       //set in vars
-      input.Call2_vod__c = Call2_vod__c;
+      input.calls = calls;
 
-      //Call2_Key_Message_vod__c
-      let Call2_Key_Message_vod__c = [];
+      //callKeyMessages
+      let callKeyMessages = [];
       {
-        let Call2_Key_Message_vod__c_Counter = 0;
+        let callKeyMessageCounter = 0;
         //generate records
-        Call2_vod__c.forEach((call) => {
+        calls.forEach((call) => {
           let displayOrderCounter = 0;
           let secondsCounter = 0;
 
-          call.Presentations.forEach((callPresentation) => {
+          call.presentations.forEach((callPresentation) => {
             //get slides for this presentation
             let slidesUsed = pseudoKeyMessagesMatrix
               .filter((item) => {
-                return item.Presentation == callPresentation.name;
+                return item.presentation == callPresentation.name;
               })
               .filter(() => Math.random() < 0.7); //use a random selection of slides
 
             //for each slide
             slidesUsed.forEach((slide) => {
               //reaction
-              let reaction = ["Positive", "Neutral", "Negative", "", "", ""][Math.floor(Math.random() * 6)];
+              let reaction = ["positive", "neutral", "negative", "", "", ""][Math.floor(Math.random() * 6)];
 
               //start time
-              let startTime = new Date(call.Call_Datetime_vod__c);
+              let startTime = new Date(call.datetime);
               secondsCounter += Math.floor(Math.random() * 30) + 1;
               startTime.setSeconds(startTime.getSeconds() + secondsCounter);
 
-              let Call2_Key_Message_vod__c_Record = {
-                ID: "0000000000000000" + (Call2_Key_Message_vod__c_Counter + 10),
-                Account_vod__c: call.Account_vod__c,
-                Call2_vod__c: call.ID,
-                Call_Date_vod__c: call.Call_Datetime_vod__c,
-                Start_Time_vod__c: startTime.toISOString(),
-                Key_Message_vod__c: slide.ID,
-                Duration_vod__c: Math.floor(Math.random() * 30) + 3,
-                Reaction_vod__c: reaction,
-                Display_Order_vod__c: displayOrderCounter + 1,
-                Key_Message_Name_vod__c: slide.Media_File_Name_vod__c.replace(".zip", ""),
-                Clm_Presentation_Name_vod__c: callPresentation.name,
-                Key_Message_vod__c: {
-                  Key_Message_Name_vod__c: slide.Media_File_Name_vod__c.replace(".zip", ""),
-                  Media_File_Name_vod__c: slide.Media_File_Name_vod__c,
-                  id: slide.ID,
-                  presentation: slide.Presentation,
-                  thisPresentation: slide.ThisPresentation,
+              let callKeyMessageRecord = {
+                id: "0000000000000000" + (callKeyMessageCounter + 10),
+                accountId: call.accountId,
+                callId: call.id,
+                callDate: call.datetime,
+                startTime: startTime.toISOString(),
+                keyMessageId: slide.id,
+                duration: Math.floor(Math.random() * 30) + 3,
+                reaction: reaction,
+                displayOrder: displayOrderCounter + 1,
+                keyMessageName: slide.mediaFileName.replace(".zip", ""),
+                presentationName: callPresentation.name,
+                keyMessage: {
+                  name: slide.mediaFileName.replace(".zip", ""),
+                  mediaFileName: slide.mediaFileName,
+                  id: slide.id,
+                  presentation: slide.presentation,
+                  thisPresentation: slide.thisPresentation,
                   testModel: {
                     slideId: null,
                   },
@@ -10783,31 +11195,32 @@ const interactionSummary = {
               };
 
               //set slide id in config for this presentation, used in test model
-              if (slide.ThisPresentation) {
-                Call2_Key_Message_vod__c_Record.Key_Message_vod__c.testModel.slideId = slide.slideIdInConfig;
+              if (slide.thisPresentation) {
+                callKeyMessageRecord.keyMessage.testModel.slideId = slide.slideIdInConfig;
               }
 
               //add record
-              Call2_Key_Message_vod__c.push(Call2_Key_Message_vod__c_Record);
+              callKeyMessages.push(callKeyMessageRecord);
 
-              Call2_Key_Message_vod__c_Counter++;
+              callKeyMessageCounter++;
               displayOrderCounter++;
             });
           });
         });
-        Call2_Key_Message_vod__c.forEach((record) => {
+        callKeyMessages.forEach((record) => {
           Object.keys(record).forEach((field) => {
-            if (fields.Call2_Key_Message_vod__c.indexOf(field) < 0) delete record[field];
+            if (field == "keyMessage") return; //keep the enriched key message
+            if (fields.callKeyMessage.indexOf(field) < 0) delete record[field];
           });
         });
-        input.Call2_Key_Message_vod__c = Call2_Key_Message_vod__c;
+        input.callKeyMessages = callKeyMessages;
       }
 
       //set in vars
-      input.Call2_vod__c = Call2_vod__c;
+      input.calls = calls;
 
-      //Planned_Call2_vod__c for "visiting this week"
-      let Planned_Call2_vod__c = [];
+      //plannedCalls for "visiting this week"
+      let plannedCalls = [];
       {
         let thisWeeksMonday = new Date();
         thisWeeksMonday.setDate(thisWeeksMonday.getDate() - thisWeeksMonday.getDay() + 1);
@@ -10825,29 +11238,29 @@ const interactionSummary = {
             //random date within Mon–Fri (between thisWeeksMonday and thisWeeksSaturday)
             let callDate = new Date(thisWeeksMonday.getTime() + Math.random() * (thisWeeksSaturday.getTime() - thisWeeksMonday.getTime()));
 
-            Planned_Call2_vod__c.push({
-              ID: "P00000000000000" + Math.random().toString().substring(2, 10),
-              Account_vod__c: account.id,
-              Call_Datetime_vod__c: callDate.toISOString(),
+            plannedCalls.push({
+              id: "P00000000000000" + Math.random().toString().substring(2, 10),
+              accountId: account.id,
+              datetime: callDate.toISOString(),
             });
           }
         });
 
-        input.Planned_Call2_vod__c = Planned_Call2_vod__c;
+        input.plannedCalls = plannedCalls;
       }
 
-      //Sent_Email_vod__c and Email_Activity_vod__c
-      let Sent_Email_vod__c = [];
-      let Email_Activity_vod__c = [];
+      //sentEmails and emailActivities
+      let sentEmails = [];
+      let emailActivities = [];
       let aeArray = [];
-      let Sent_Email_vod__c_Counter = 0;
-      let Email_Activity_vod__c_Counter = 0;
+      let sentEmailCounter = 0;
+      let emailActivityCounter = 0;
 
       if (visibility.contentItems.emails) {
         accounts.forEach((account) => {
           if (account.doNotGenerateTestData) return;
 
-          //Sent_Email_vod__c
+          //sentEmails
           {
             {
               if (vars.emailCart.active) {
@@ -10951,44 +11364,44 @@ const interactionSummary = {
                 }
                 fragments = fragments.sort(() => 0.5 - Math.random()).slice(0, Math.floor(Math.random() * (fragments.length + 1))); //random selection of fragments
 
-                let Sent_Email_vod__c_Record = {
-                  ID: "0000000000000000" + (Sent_Email_vod__c_Counter + 10),
-                  Account_vod__c: account.id,
-                  Email_Fragments_vod__c: fragments.map((item) => item.crmId).join(","),
-                  Approved_Email_Template_vod__c: template.crmId,
-                  Email_Sent_Date_vod__c: emailDate.toISOString(),
-                  Opened_vod__c: emailOpened,
-                  Open_Count_vod__c: openCount ? openCount : 0,
-                  Last_Activity_Date_vod__c: openEmailDate ? openEmailDate.toISOString() : "",
-                  Click_Count_vod__c: clickCount ? clickCount : 0,
-                  Last_Open_Date_vod__c: openEmailDate ? openEmailDate.toISOString() : "",
-                  Approved_Document_Views_vod__c: null,
-                  Status_vod__c: "Delivered_vod",
+                let sentEmailRecord = {
+                  id: "0000000000000000" + (sentEmailCounter + 10),
+                  accountId: account.id,
+                  emailFragments: fragments.map((item) => item.crmId).join(","),
+                  emailTemplateId: template.crmId,
+                  sentDate: emailDate.toISOString(),
+                  opened: emailOpened,
+                  openCount: openCount ? openCount : 0,
+                  lastActivityDate: openEmailDate ? openEmailDate.toISOString() : "",
+                  clickCount: clickCount ? clickCount : 0,
+                  lastOpenDate: openEmailDate ? openEmailDate.toISOString() : "",
+                  documentViews: null,
+                  status: "delivered",
                 };
 
-                Sent_Email_vod__c.push(Sent_Email_vod__c_Record);
+                sentEmails.push(sentEmailRecord);
 
-                Sent_Email_vod__c_Counter++;
+                sentEmailCounter++;
               }
             }
-            Sent_Email_vod__c.forEach((record) => {
+            sentEmails.forEach((record) => {
               Object.keys(record).forEach((field) => {
-                if (fields.Sent_Email_vod__c.indexOf(field) < 0) delete record[field];
+                if (fields.sentEmail.indexOf(field) < 0) delete record[field];
               });
             });
           }
 
-          //Email_Activity_vod__c
+          //emailActivities
           {
-            Sent_Email_vod__c.forEach((sentEmail) => {
-              if (!sentEmail.Opened_vod__c) return;
+            sentEmails.forEach((sentEmail) => {
+              if (!sentEmail.opened) return;
 
               let activitiesArr = [];
-              for (let i = 0; i < sentEmail.Open_Count_vod__c; i++) {
-                activitiesArr.push("Opened_vod");
+              for (let i = 0; i < sentEmail.openCount; i++) {
+                activitiesArr.push("opened");
               }
-              for (let i = 0; i < sentEmail.Click_Count_vod__c; i++) {
-                activitiesArr.push("Clicked_vod");
+              for (let i = 0; i < sentEmail.clickCount; i++) {
+                activitiesArr.push("clicked");
               }
 
               activitiesArr.forEach((activityType) => {
@@ -10996,9 +11409,9 @@ const interactionSummary = {
                 let vaultDocName;
                 let vaultDocNumber;
                 let fragmentId;
-                if (activityType == "Clicked_vod") {
-                  if (!sentEmail.Email_Fragments_vod__c) return;
-                  let fragmentsArr = sentEmail.Email_Fragments_vod__c.split(",");
+                if (activityType == "clicked") {
+                  if (!sentEmail.emailFragments) return;
+                  let fragmentsArr = sentEmail.emailFragments.split(",");
                   let fragmentIndex = Math.floor(Math.random() * fragmentsArr.length);
                   let fragment = aeArray.find((item) => item.crmId == fragmentsArr[fragmentIndex]);
 
@@ -11010,25 +11423,25 @@ const interactionSummary = {
                   fragmentId = fragment.crmId;
                 }
 
-                let Email_Activity_vod__c_Record = {
-                  Activity_DateTime_vod__c: sentEmail.Last_Activity_Date_vod__c,
-                  Vault_Doc_ID_vod__c: vaultDocID ? vaultDocID : "",
-                  Sent_Email_vod__c: sentEmail.ID,
-                  Vault_Doc_Name_vod__c: vaultDocName ? vaultDocName : "",
-                  Event_type_vod__c: activityType,
-                  Vault_Document_Number_vod__c: vaultDocNumber ? vaultDocNumber : "",
-                  ID: "0000000000000000" + (Email_Activity_vod__c_Counter + 10),
-                  Approved_Document_vod__c: fragmentId ? fragmentId : "",
+                let emailActivityRecord = {
+                  activityDatetime: sentEmail.lastActivityDate,
+                  vaultDocId: vaultDocID ? vaultDocID : "",
+                  sentEmailId: sentEmail.id,
+                  vaultDocName: vaultDocName ? vaultDocName : "",
+                  eventType: activityType,
+                  vaultDocumentNumber: vaultDocNumber ? vaultDocNumber : "",
+                  id: "0000000000000000" + (emailActivityCounter + 10),
+                  approvedDocumentId: fragmentId ? fragmentId : "",
                 };
 
-                Email_Activity_vod__c.push(Email_Activity_vod__c_Record);
+                emailActivities.push(emailActivityRecord);
 
-                Email_Activity_vod__c_Counter++;
+                emailActivityCounter++;
               });
             });
-            Email_Activity_vod__c.forEach((record) => {
+            emailActivities.forEach((record) => {
               Object.keys(record).forEach((field) => {
-                if (fields.Email_Activity_vod__c.indexOf(field) < 0) delete record[field];
+                if (fields.emailActivity.indexOf(field) < 0) delete record[field];
               });
             });
           }
@@ -11036,8 +11449,8 @@ const interactionSummary = {
       }
 
       //set in vars
-      input.Sent_Email_vod__c = Sent_Email_vod__c;
-      input.Email_Activity_vod__c = Email_Activity_vod__c;
+      input.sentEmails = sentEmails;
+      input.emailActivities = emailActivities;
 
       //remove temporary property
       accounts.forEach((account) => {
@@ -11184,7 +11597,21 @@ const interactionSummary = {
         this.accountView.init();
         this.allAccountsView.init();
       }
+
+      interactionSummary.initialized = true;
+
+      //modal opened while the model was still being generated: afterOpen found no elements, show the view now
+      if (this.pendingAccountView) {
+        this.pendingAccountView = false;
+        if (output.currentAccount.account.flags.noActivity) {
+          //nothing to show and the open button is now disabled: close the modal
+          if (this.elements.modal && typeof this.elements.modal.close === "function") this.elements.modal.close();
+        } else {
+          this.setActiveView("accountView");
+        }
+      }
     },
+    pendingAccountView: false,
     disableOpenButton: function () {
       const vars = clm.vars;
       const components = interactionSummary.components;
@@ -11223,9 +11650,15 @@ const interactionSummary = {
     },
     afterOpen: function () {
       const output = interactionSummary.output;
-      //account view: show
+      //account view: show (once ui.init has run after the model, which can still be in progress right after the slide loads)
       if (interactionSummary.mode == "accountView") {
-        this.setActiveView("accountView");
+        if (interactionSummary.initialized) {
+          this.setActiveView("accountView");
+        } else {
+          this.pendingAccountView = true;
+          //wait view label (ui.init sets the labels, it has not run yet)
+          util.setLabels(document.querySelector(`#${interactionSummary.components.modal.id}`), interactionSummary.labels.waitView);
+        }
       }
 
       //all accounts view: generate model, populate and show
@@ -11261,6 +11694,12 @@ const interactionSummary = {
       }
     },
     afterClose: function () {
+      //account view not built: closed before ui.init ran (model still in progress) or no activity
+      if (interactionSummary.mode == "accountView" && (!interactionSummary.initialized || interactionSummary.output.currentAccount.account.flags.noActivity)) {
+        this.pendingAccountView = false;
+        return;
+      }
+
       //re-populet and set account view
       if (interactionSummary.mode == "accountView") {
         this.accountView.elements.tab.resetToDefaults();
@@ -11565,9 +12004,9 @@ const interactionSummary = {
                   case "approvedEmail":
                     return interaction.type == "email";
                   case "inPerson":
-                    return interaction.type == "call" && (interaction.call.channel == "Face_to_face_vod" || !interaction.call.channel);
+                    return interaction.type == "call" && (interaction.call.channel == "faceToFace" || !interaction.call.channel);
                   case "videoCall":
-                    return interaction.type == "call" && interaction.call.channel == "Video_vod";
+                    return interaction.type == "call" && interaction.call.channel == "video";
                 }
               }).length;
 
@@ -11906,7 +12345,9 @@ const interactionSummary = {
             relatedCLMSpan.innerHTML = labels.accountView.summary_RelatedCLM_noData;
           } else {
             let mostRecentDate = tmpArr[0].mostRecentCall.date;
-            let mostRecentMaterial = tmpArr[0].name;
+            //names are kept once in output.contentItems (removed from account records to keep session data small)
+            let contentItem = output.contentItems.relatedCLM.find((item) => item.id == tmpArr[0].id);
+            let mostRecentMaterial = contentItem ? contentItem.name : "";
             if (mostRecentMaterial && mostRecentMaterial.length > 20) {
               mostRecentMaterial = mostRecentMaterial.substring(0, 17) + "..";
             }
@@ -12032,12 +12473,12 @@ const interactionSummary = {
             break;
           case "inPerson":
             filteredInteractions = output.currentAccount.timeline.filter((interaction) => {
-              return interaction.type == "call" && (interaction.call.channel == "Face_to_face_vod" || !interaction.call.channel);
+              return interaction.type == "call" && (interaction.call.channel == "faceToFace" || !interaction.call.channel);
             });
             break;
           case "videoCall":
             filteredInteractions = output.currentAccount.timeline.filter((interaction) => {
-              return interaction.type == "call" && interaction.call.channel == "Video_vod";
+              return interaction.type == "call" && interaction.call.channel == "video";
             });
         }
 
@@ -12055,12 +12496,12 @@ const interactionSummary = {
               break;
             case "call":
               switch (interaction.call.channel) {
-                case "Video_vod":
+                case "video":
                   row = templates.videoCall.row.cloneNode(true);
                   subRowHeader = templates.videoCall.subRowHeader.cloneNode(true);
                   subRow = templates.videoCall.subRow.cloneNode(true);
                   break;
-                case "Face_to_face_vod":
+                case "faceToFace":
                 default:
                   row = templates.inPerson.row.cloneNode(true);
                   subRowHeader = templates.inPerson.subRowHeader.cloneNode(true);
@@ -12130,15 +12571,15 @@ const interactionSummary = {
                 row.querySelector('[data-column-id="contentName"] [data-ui-type="table-row-cell-value"]').innerHTML = contentName;
                 //field: status
                 switch (interaction.call.status) {
-                  case "Saved_vod":
+                  case "saved":
                     row.querySelector('[data-column-id="status"] [data-ui-type="table-row-cell-value"][data-ui-subtype="valuePlanned"]').remove();
                     row.querySelector('[data-column-id="status"] [data-ui-type="table-row-cell-value"][data-ui-subtype="valueSubmitted"]').remove();
                     break;
-                  case "Planned_vod":
+                  case "planned":
                     row.querySelector('[data-column-id="status"] [data-ui-type="table-row-cell-value"][data-ui-subtype="valueSaved"]').remove();
                     row.querySelector('[data-column-id="status"] [data-ui-type="table-row-cell-value"][data-ui-subtype="valueSubmitted"]').remove();
                     break;
-                  case "Submitted_vod":
+                  case "submitted":
                     row.querySelector('[data-column-id="status"] [data-ui-type="table-row-cell-value"][data-ui-subtype="valueSaved"]').remove();
                     row.querySelector('[data-column-id="status"] [data-ui-type="table-row-cell-value"][data-ui-subtype="valuePlanned"]').remove();
                     break;
@@ -12236,7 +12677,7 @@ const interactionSummary = {
                   if (fieldsVisibility.pres_reaction) {
                     if (slide.reaction) {
                       subRowClone.querySelector('[data-column-id="reaction"]').classList.add(slide.reaction.toLowerCase());
-                      subRowClone.querySelector('[data-column-id="reaction"] [data-ui-type="table-subrow-cell-value"].text').innerHTML = slide.reaction;
+                      subRowClone.querySelector('[data-column-id="reaction"] [data-ui-type="table-subrow-cell-value"].text').innerHTML = slide.reaction.charAt(0).toUpperCase() + slide.reaction.slice(1);
                     } else {
                       subRowClone.querySelector('[data-column-id="reaction"] [data-ui-type="table-subrow-cell-value"].text').innerHTML = "";
                     }
@@ -12490,7 +12931,7 @@ const interactionSummary = {
             if (fieldsVisibility.reaction) {
               if (slide.mostRecentCall.reaction) {
                 slideClone.querySelector('[data-type="slides_content_reaction"]').classList.add(slide.mostRecentCall.reaction.toLowerCase());
-                slideClone.querySelector('[data-type="slides_content_reaction"] [data-ui-type="value"]').innerHTML = slide.mostRecentCall.reaction;
+                slideClone.querySelector('[data-type="slides_content_reaction"] [data-ui-type="value"]').innerHTML = slide.mostRecentCall.reaction.charAt(0).toUpperCase() + slide.mostRecentCall.reaction.slice(1);
               } else {
                 slideClone.querySelector('[data-type="slides_content_reaction"] [data-ui-type="value"]').innerHTML = " -- ";
               }
@@ -14777,8 +15218,8 @@ const emailCart = {
       // launchApprovedEmail will ask the user to select an account if needed; then the slide will reload silently
       clm.vars.mediaDetection.suppressAlert = true;
 
-      // veeva api call
-      com.veeva.clm.launchApprovedEmail(templateID, fragmentIDs, (result) => {
+      // CRM call
+      crm.launchApprovedEmail(templateID, fragmentIDs).then((result) => {
         util.log(result);
       });
     },
@@ -17691,6 +18132,16 @@ const customFlows = {
       return { allowed: allowed, count: count, max: max };
     },
 
+    // Persist clm.persistentData; tells the rep when the save didn't reach storage (details in util.log)
+    saveFlows: async function() {
+      const saved = await storage.persistentData.update();
+      if (!saved) {
+        const labels = clm.vars.customFlowsMaker.labels || {};
+        alert(labels.flowSaveFailed || 'Your flows could not be saved. Changes may be lost when the app is closed.');
+      }
+      return saved;
+    },
+
     getMaxFlowsMessage: function() {
       const labels = clm.vars.customFlowsMaker.labels || {};
       return (labels.maxFlowsReachedMessage || 'You have reached the maximum of ##count## flows')
@@ -17730,7 +18181,7 @@ const customFlows = {
       
       // Delete flow
       delete clm.persistentData.customFlows.flows[flowId];
-      await storage.persistentData.update();
+      await this.saveFlows();
       
       // Refresh management screen
       customFlows.ui.renderManagementScreen();
@@ -17826,7 +18277,7 @@ const customFlows = {
       clm.persistentData.customFlows.flows[flowId].lastUpdated = now;
 
       // Save to storage
-      await storage.persistentData.update();
+      await this.saveFlows();
       
       // Refresh management screen UI to show updated assignments
       customFlows.ui.renderManagementScreen();
@@ -18105,11 +18556,12 @@ const customFlows = {
       clm.persistentData.customFlows.flows[flowId] = newFlow;
       
       // Save to storage
-      await storage.persistentData.update();
+      const saved = await this.saveFlows();
       
       return { 
         success: true, 
-        flowId: flowId 
+        flowId: flowId,
+        saved: saved
       };
     },
     
@@ -19109,7 +19561,7 @@ const customFlows = {
         // Preserve: id, assignedAccounts, createdAt
         
         // Save updated data
-        await storage.persistentData.update();
+        await this.saveFlows();
         
       } else {
         // Create new flow
@@ -19146,7 +19598,7 @@ const customFlows = {
         clm.persistentData.customFlows.flows[flowId] = newFlow;
         
         // Save updated data
-        await storage.persistentData.update();
+        await this.saveFlows();
         
       }
       
@@ -20050,7 +20502,7 @@ const accountSelector = {
       // Avatar type
       const avatarEl = row.querySelector('[data-ui-id="accountSelectorAccountAvatar"]');
       if (avatarEl) {
-        if (acc.account.recordTypeName === "Professional") {
+        if (acc.account.type === "professional") {
           avatarEl.setAttribute("data-account-type", "HCP");
         } else {
           avatarEl.setAttribute("data-account-type", "HCO");
@@ -22635,8 +23087,8 @@ const messenger = {
 /**
  * Storage Module
  * 
- * Centralized storage abstraction layer for localStorage and sessionStorage.
- * Provides unified async-compatible API for future Veeva CRM integration.
+ * Centralized storage abstraction layer for sessionStorage and persistent storage
+ * (localStorage, or a field on a CRM record: Veeva CRM / Vault CRM).
  * 
  * @module storage
  */
@@ -22647,6 +23099,21 @@ const storage = {
   state: {
     initialized: false,
     key: null, // Generated storage key (set during init)
+    veevaField: {
+      target: null,       // platform block from clm.vars.storage.veevaField ({ object, field, match })
+      matchValues: null,  // match token -> resolved id (e.g. { currentUser: "005..." })
+      recordId: null,     // CRM record holding Kona's envelope (null until found or created)
+      verified: false,    // a write was read back successfully in this session
+      fallback: false,    // CRM unavailable: localStorage is used for the rest of the session
+      writeQueue: Promise.resolve(), // serializes CRM writes (one create, then updates)
+    },
+  },
+
+  /* CONSTANTS --------------------------------------------*/
+  constants: {
+    envelopeMark: "persistentData", // envelope.kona value: tells Kona's field values from foreign ones
+    mirrorSuffix: "_PERSISTENT",     // sessionStorage key suffix for the veevaField session mirror
+    matchObjects: { currentUser: "user", currentPresentation: "presentation", currentAccount: "account" },
   },
 
   /* INIT -------------------------------------------------*/
@@ -22679,18 +23146,32 @@ const storage = {
       }
     }
 
+    // veevaField: the current platform's block must be complete, otherwise localStorage
+    if (this.api.persistent.method === 'veevaField') {
+      this.state.veevaField.target = this.veevaFieldTarget();
+      if (!this.state.veevaField.target) {
+        this.api.persistent.method = 'localStorage';
+      }
+    }
+
     // Load sessionData from session storage (if available)
     this.sessionData.load();
     if (this.sessionData.flags.wasEmpty) {
       this.sessionData.reset(); // Ensure sessionData is initialized to template if nothing found
       this.sessionData.update();  // Save initial template to session storage
+      this.mirror.remove();       // New session: the veevaField mirror is re-read from the CRM
     }
 
     // Load persistentData from persistent storage (if available)
     await this.persistentData.load();
     if (this.persistentData.flags.wasEmpty) {
-      this.persistentData.reset(); // Ensure persistentData is initialized to template if nothing found
-      await this.persistentData.update();  // Save initial template to persistent storage
+      if (this.api.persistent.method === 'veevaField') {
+        // No CRM write here: the first real save creates the record
+        clm.persistentData = JSON.parse(JSON.stringify(clm.persistentDataTemplate));
+      } else {
+        this.persistentData.reset(); // Ensure persistentData is initialized to template if nothing found
+        await this.persistentData.update();  // Save initial template to persistent storage
+      }
     }
 
     // Set initialization flag
@@ -22715,6 +23196,71 @@ const storage = {
     const key = `${cleanName}_${cleanVersion}`;
     
     return key;
+  },
+
+  /* VEEVA FIELD TARGET -----------------------------------*/
+  /**
+   * Current platform's block from clm.vars.storage.veevaField ({ object, field, match }).
+   * Registers the object in the crm driver as "persistentStore". Logs and returns null when incomplete.
+   * @returns {Object|null}
+   */
+  veevaFieldTarget: function() {
+    const platform = crm.platform();
+    const cfg = clm.vars.storage.veevaField ? clm.vars.storage.veevaField[platform] : null;
+    const matchOk = cfg && Array.isArray(cfg.match) && cfg.match.length > 0 &&
+      cfg.match.every(m => m && typeof m.field === 'string' && m.field && typeof m.value === 'string' && m.value);
+    if (!cfg || typeof cfg.object !== 'string' || !cfg.object || typeof cfg.field !== 'string' || !cfg.field || !matchOk) {
+      util.log(`[storage.init] persistentMethod "veevaField" needs storage.veevaField.${platform} with object, field and match - using localStorage`, 'error');
+      return null;
+    }
+    const fields = { value: cfg.field };
+    cfg.match.forEach(m => { fields[m.field] = m.field; });
+    crm.registerObject('persistentStore', cfg.object, fields);
+    return cfg;
+  },
+
+  /* SESSION MIRROR (veevaField) --------------------------*/
+  /**
+   * sessionStorage copy of the veevaField state, so the CRM is read once per session
+   * and not on every slide. { data, recordId, matchValues, verified, fallback }
+   */
+  mirror: {
+    key: () => storage.state.key + storage.constants.mirrorSuffix,
+
+    read: function() {
+      try {
+        const value = window.sessionStorage.getItem(this.key());
+        return value === null ? null : JSON.parse(value);
+      } catch (error) {
+        util.log(`[storage.mirror.read] ${error.message}`, 'error');
+        return null;
+      }
+    },
+
+    write: function(data) {
+      const vf = storage.state.veevaField;
+      try {
+        window.sessionStorage.setItem(this.key(), JSON.stringify({
+          data: data,
+          recordId: vf.recordId,
+          matchValues: vf.matchValues,
+          verified: vf.verified,
+          fallback: vf.fallback,
+        }));
+        return true;
+      } catch (error) {
+        util.log(`[storage.mirror.write] ${error.message}`, 'error');
+        return false;
+      }
+    },
+
+    remove: function() {
+      try {
+        window.sessionStorage.removeItem(this.key());
+      } catch (error) {
+        util.log(`[storage.mirror.remove] ${error.message}`, 'error');
+      }
+    }
   },
 
   /* API --------------------------------------------------*/
@@ -22878,12 +23424,190 @@ const storage = {
         }
       },
 
-      // Veeva Field Storage Implementation (stubbed for future development)
+      // CRM Field Storage Implementation (Veeva CRM / Vault CRM)
+      // Kona's value is an envelope { kona: "persistentData", savedAt, data } on a record of its own:
+      // records matched by config whose field holds anything else (another app's data) are never written.
       veevaField: {
-        read: async function() {},
-        write: async function(value, options = {}) {},
-        remove: async function() {},
-        clear: async function() {}
+        read: async function() {
+          const vf = storage.state.veevaField;
+
+          // Same session: the mirror holds the data and the record id
+          const mirror = storage.mirror.read();
+          if (mirror) {
+            vf.recordId = mirror.recordId || null;
+            vf.matchValues = mirror.matchValues || null;
+            vf.verified = !!mirror.verified;
+            vf.fallback = !!mirror.fallback;
+            return mirror.data == null ? null : mirror.data;
+          }
+
+          let data = null;
+          const found = await this.readFromCrm();
+          if (found.ok) {
+            data = found.data;
+          } else {
+            vf.fallback = true;
+            util.log('[storage.veevaField.read] CRM field not available - using localStorage for this session', 'error');
+            data = await storage.api.persistent.localStorage.read();
+          }
+          storage.mirror.write(data);
+          return data;
+        },
+
+        write: async function(value, options = {}) {
+          const vf = storage.state.veevaField;
+          const envelope = { kona: storage.constants.envelopeMark, savedAt: Date.now(), data: value };
+          const text = this.encode(envelope);
+
+          const limit = clm.vars.storage.limits.veevaField;
+          if (limit && text.length > limit) {
+            util.log(`[storage.veevaField.write] Size exceeded: ${text.length} characters > ${limit} limit`, 'error');
+            return false;
+          }
+
+          // Local copies first: the next slide sees the change even if the CRM write is still running
+          storage.mirror.write(value);
+          const localOk = await storage.api.persistent.localStorage.write(value);
+          if (vf.fallback) return localOk;
+
+          const run = vf.writeQueue.then(() => this.writeToCrm(text, envelope.savedAt)).catch((error) => {
+            util.log(`[storage.veevaField.write] ${error && error.message ? error.message : error}`, 'error');
+            return false;
+          });
+          vf.writeQueue = run;
+          const ok = await run;
+          storage.mirror.write(value); // record id / verified / fallback may have changed
+          return ok;
+        },
+
+        // Empties Kona's envelope; the record itself is kept
+        remove: async function() {
+          const vf = storage.state.veevaField;
+          storage.mirror.write(null);
+          await storage.api.persistent.localStorage.remove();
+          if (vf.fallback || !vf.recordId) return true;
+          return await this.write(null);
+        },
+
+        clear: async function() {
+          return await this.remove();
+        },
+
+        /* helpers ---------------------------------------*/
+
+        // JSON with & < > ' written as \u escapes, so platform HTML-escaping can always be undone on read
+        encode: function(value) {
+          return JSON.stringify(value).replace(/[&<>']/g, (c) => '\\u' + ('0000' + c.charCodeAt(0).toString(16)).slice(-4));
+        },
+
+        decodeEntities: function(text) {
+          return text
+            .replace(/&quot;/g, '"')
+            .replace(/&#0?39;/g, "'")
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&amp;/g, '&');
+        },
+
+        // Field value -> envelope, or null when the value is not Kona's (empty, other format, not JSON)
+        parseEnvelope: function(raw) {
+          if (typeof raw !== 'string' || raw === '') return null;
+          let parsed = null;
+          try {
+            parsed = JSON.parse(this.decodeEntities(raw));
+          } catch (error) {
+            return null;
+          }
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+          if (parsed.kona !== storage.constants.envelopeMark || typeof parsed.savedAt !== 'number') return null;
+          if (parsed.data !== null && (typeof parsed.data !== 'object' || Array.isArray(parsed.data))) return null;
+          return parsed;
+        },
+
+        // match tokens -> ids (currentUser / currentPresentation / currentAccount); other values are used as they are
+        resolveMatch: async function() {
+          const vf = storage.state.veevaField;
+          const values = {};
+          for (const m of vf.target.match) {
+            if (Object.prototype.hasOwnProperty.call(values, m.value)) continue;
+            const object = storage.constants.matchObjects[m.value];
+            if (!object) {
+              values[m.value] = m.value;
+              continue;
+            }
+            const current = await crm.getCurrent(object, ['id']);
+            if (!current || !current.id) {
+              util.log(`[storage.veevaField] ${m.value} id not available`, 'error');
+              return null;
+            }
+            values[m.value] = current.id;
+          }
+          return values;
+        },
+
+        conditions: function() {
+          const vf = storage.state.veevaField;
+          return vf.target.match.map(m => ({ field: m.field, value: vf.matchValues[m.value] }));
+        },
+
+        // { ok, data }: ok false when the CRM can't be queried
+        readFromCrm: async function() {
+          const vf = storage.state.veevaField;
+          vf.matchValues = await this.resolveMatch();
+          if (!vf.matchValues) return { ok: false, data: null };
+
+          const result = await crm.query('persistentStore', ['id', 'value'], this.conditions());
+          if (!result.success) return { ok: false, data: null };
+
+          let best = null;
+          let foreign = 0;
+          result.records.forEach(record => {
+            const envelope = this.parseEnvelope(record.value);
+            if (!envelope) {
+              foreign++;
+              return;
+            }
+            if (!best || envelope.savedAt > best.envelope.savedAt) best = { id: record.id, envelope: envelope };
+          });
+          if (foreign) {
+            util.log(`[storage.veevaField.read] ${foreign} record(s) without Kona data ignored (${vf.target.object}.${vf.target.field})`);
+          }
+
+          vf.recordId = best ? best.id : null;
+          return { ok: true, data: best ? best.envelope.data : null };
+        },
+
+        writeToCrm: async function(text, savedAt) {
+          const vf = storage.state.veevaField;
+          if (vf.fallback) return true;
+
+          let result;
+          if (vf.recordId) {
+            result = await crm.update('persistentStore', vf.recordId, { value: text });
+          } else {
+            const values = { value: text };
+            vf.target.match.forEach(m => { values[m.field] = vf.matchValues[m.value]; });
+            result = await crm.create('persistentStore', values);
+            if (result.success && result.id) vf.recordId = result.id;
+          }
+          if (!result.success || !vf.recordId) {
+            util.log(`[storage.veevaField.write] ${vf.recordId ? 'update' : 'create'} failed: ${result.message}`, 'error');
+            return false;
+          }
+
+          // updateRecord reports success when the user can't write the field: read the first write back
+          if (!vf.verified) {
+            const check = await crm.query('persistentStore', ['id', 'value'], [{ field: 'id', value: vf.recordId }]);
+            const envelope = check.success && check.records.length ? this.parseEnvelope(check.records[0].value) : null;
+            if (!envelope || envelope.savedAt !== savedAt) {
+              vf.fallback = true;
+              util.log(`[storage.veevaField.write] ${vf.target.object}.${vf.target.field} not saved (no field access?) - using localStorage for this session`, 'error');
+              return false;
+            }
+            vf.verified = true;
+          }
+          return true;
+        }
       }
     }
   },
@@ -23240,7 +23964,7 @@ const rteBuilder = {
       let fragmentIds = Array.isArray(payload && payload.fragmentIds) ? payload.fragmentIds : [];
       let fragmentCrmIds = this._buildFragmentCrmIds(template, customizationSelections, fragmentIds);
 
-      // Browser mode: log only, do not call Veeva
+      // Browser mode: log only, do not call the CRM
       if (vars.options.browserMode.active) {
         util.log("rteBuilder.api.send [browser mode]");
         util.log("  templateCrmId:  " + template.crmId);
@@ -23248,9 +23972,9 @@ const rteBuilder = {
         return;
       }
 
-      // Veeva call
+      // CRM call
       clm.vars.mediaDetection.suppressAlert = true;
-      com.veeva.clm.launchApprovedEmail(template.crmId, fragmentCrmIds, (result) => {
+      crm.launchApprovedEmail(template.crmId, fragmentCrmIds).then((result) => {
         util.log(result);
       });
     },
@@ -23269,7 +23993,7 @@ const rteBuilder = {
       // Build fragment CRM ID array
       let fragmentCrmIds = this._buildFragmentCrmIds(template, state.templateCustomization, state.selectedFragmentIds);
 
-      // Browser mode: log only, do not call Veeva
+      // Browser mode: log only, do not call the CRM
       if (vars.options.browserMode.active) {
         util.log("rteBuilder.api.launchApprovedEmail [browser mode]");
         util.log("  templateCrmId:  " + template.crmId);
@@ -23277,9 +24001,9 @@ const rteBuilder = {
         return;
       }
 
-      // Veeva call
+      // CRM call
       clm.vars.mediaDetection.suppressAlert = true;
-      com.veeva.clm.launchApprovedEmail(template.crmId, fragmentCrmIds, (result) => {
+      crm.launchApprovedEmail(template.crmId, fragmentCrmIds).then((result) => {
         util.log(result);
       });
     },
@@ -25166,6 +25890,7 @@ const clm = {
         presentation: null,
       },
       localPath: null,
+      jsLibrary: null,
     },
     session: {
       isNewSession: null,
@@ -25279,8 +26004,8 @@ const clm = {
           // CONTENT TARGETING: a custom field that will contain a list of slides for the account
           active: null,
           type: null, // custom-field or dynamic-attribute
-          object: null, // for custom-field, the object name (Account or TSF_vod__c)
-          field: null, // for custom-field or dynamic-attribute name
+          object: null, // for custom-field, the neutral object name (account or tsf)
+          field: null, // custom-field: platform field name, one string or { veeva, vault }; dynamic-attribute: attribute name
           menu: {
             standard: {
               // standard menu will be hidden if a dynamic presentation is in place
@@ -25758,7 +26483,8 @@ const clm = {
         id: null,
         name: null,
         salutation: null,
-        recordType: null,
+        recordTypeName: null, //account type label (display)
+        type: null, //account type neutral key: professional, hospital, ... (see crm module)
       },
       allAccounts: [
         {
@@ -25766,6 +26492,7 @@ const clm = {
           name: null,
           salutation: null,
           recordTypeName: null,
+          type: null,
         },
       ],
       presentation: {
@@ -25883,8 +26610,8 @@ const clm = {
         veevaField: null,
       },
       veevaField: {
-        object: null,
-        field: null,
+        veeva: null,
+        vault: null,
       },
     },
   },
@@ -25993,6 +26720,9 @@ const clm = {
     {
       //config read settings
       this.readSettings();
+
+      //CRM platform driver (Veeva CRM / Vault CRM)
+      crm.init(this.vars.project.jsLibrary);
 
       //common html
       if (this.vars.options.htmlSlideId == "Common") {
@@ -26113,6 +26843,7 @@ const clm = {
     vars.project.version = util.readSetting(com_idc_params, "project.version", "string", "1.0");
     vars.project.vaultExternalID.presentation = util.readSetting(com_idc_params, "project.vaultExternalID.presentation", "string", null);
     vars.project.localPath = util.readSetting(com_idc_params, "project.localPath", "string", null);
+    vars.project.jsLibrary = util.readSetting(com_idc_params, "project.jsLibrary", "string", "");
 
     //slide id from slide/index.html
     vars.options.htmlSlideId = util.getElementAttribute(document.querySelector("body"), "data-slide-id");
@@ -26191,7 +26922,7 @@ const clm = {
         "dynamicPresentation.source.contentTargeting.object",
         "string",
       );
-      vars.dynamicPresentation.source.contentTargeting.field = util.readSetting(com_idc_params, "dynamicPresentation.source.contentTargeting.field", "string");
+      vars.dynamicPresentation.source.contentTargeting.field = util.readSetting(com_idc_params, "dynamicPresentation.source.contentTargeting.field");
       //content targeting standard menu
       vars.dynamicPresentation.source.contentTargeting.menu.standard.id = util.readSetting(
         com_idc_params,
@@ -27206,10 +27937,11 @@ const clm = {
       interactionSummary.testModel.emptyAccountsRatio = util.readSetting(com_idc_params, "interactionSummary.testModel.emptyAccountsRatio", "number", 0.5);
 
       //fields
-      interactionSummary.fields.Call2_vod__c = util.readSetting(com_idc_params, "interactionSummary.fields.Call2_vod__c", "object", []);
-      interactionSummary.fields.Call2_Key_Message_vod__c = util.readSetting(com_idc_params, "interactionSummary.fields.Call2_Key_Message_vod__c", "object", []);
-      interactionSummary.fields.Sent_Email_vod__c = util.readSetting(com_idc_params, "interactionSummary.fields.Sent_Email_vod__c", "object", []);
-      interactionSummary.fields.Email_Activity_vod__c = util.readSetting(com_idc_params, "interactionSummary.fields.Email_Activity_vod__c", "object", []);
+      //neutral field names per neutral object (see crm module)
+      interactionSummary.fields.call = util.readSetting(com_idc_params, "interactionSummary.fields.call", "object", []);
+      interactionSummary.fields.callKeyMessage = util.readSetting(com_idc_params, "interactionSummary.fields.callKeyMessage", "object", []);
+      interactionSummary.fields.sentEmail = util.readSetting(com_idc_params, "interactionSummary.fields.sentEmail", "object", []);
+      interactionSummary.fields.emailActivity = util.readSetting(com_idc_params, "interactionSummary.fields.emailActivity", "object", []);
 
       //non-emailCart templates (this module relies on Email Cart configuration)
       if (com_idc_params.emailCart) {
@@ -27338,8 +28070,9 @@ const clm = {
       vars.storage.limits.session = util.readSetting(com_idc_params, "storage.limits.session", "number", 3145728);
       vars.storage.limits.persistent = util.readSetting(com_idc_params, "storage.limits.persistent", "number", 3145728);
       vars.storage.limits.veevaField = util.readSetting(com_idc_params, "storage.limits.veevaField", "number", 131072);
-      vars.storage.veevaField.object = util.readSetting(com_idc_params, "storage.veevaField.object", "string", null);
-      vars.storage.veevaField.field = util.readSetting(com_idc_params, "storage.veevaField.field", "string", null);
+      //one { object, field, match } block per CRM platform; the one for crm.platform() is used
+      vars.storage.veevaField.veeva = util.readSetting(com_idc_params, "storage.veevaField.veeva", "object", null, false);
+      vars.storage.veevaField.vault = util.readSetting(com_idc_params, "storage.veevaField.vault", "object", null, false);
     }
   },
   setCallStatusAndId: function () {
@@ -27359,17 +28092,15 @@ const clm = {
         }
         resolve();
       } else {
-        //veeva environment: try to retrieve call ID to determine if it is an actual call or not
-        com.veeva.clm.getDataForCurrentObject("Call", "ID", (data) => {
-          if (data.success) {
-            vars.session.isAnActualCall = true; //Veeva retrieved a call id >> it is an actual call
-            vars.session.callId = data.Call.ID; //Store call ID
-
-            resolve();
+        //CRM environment: try to retrieve call ID to determine if it is an actual call or not
+        crm.getCurrent("call", "id", { quiet: true }).then((call) => {
+          if (call && call.id) {
+            vars.session.isAnActualCall = true; //CRM retrieved a call id >> it is an actual call
+            vars.session.callId = call.id; //Store call ID
           } else {
-            vars.session.isAnActualCall = false; //Veeva did not retrieve a call id >> it is not an actual call
-            resolve();
+            vars.session.isAnActualCall = false; //CRM did not retrieve a call id >> it is not an actual call
           }
+          resolve();
         });
       }
     });
@@ -27691,91 +28422,69 @@ const clm = {
           } else {
             //data not cached >> query
 
+            //a failed query leaves the data uncached so the next slide retries
+            let queryFailed = false;
+
             //if an actual call, obtain current account id first
             if (this.vars.session.isAnActualCall) {
-              await new Promise((resolve) => {
-                com.veeva.clm.getDataForCurrentObject("Account", "ID", (data) => {
-                  if (data.success) {
-                    this.vars.metadata.account.id = data.Account.ID;
-                    resolve();
-                  }
-                });
-              });
+              let current = await crm.getCurrent("account", "id");
+              if (current && current.id) {
+                this.vars.metadata.account.id = current.id;
+              } else {
+                queryFailed = true;
+              }
             }
 
             //query current account  (if actual call) or all accounts (if media)
-            let accountRecords = await new Promise((resolve) => {
-              let whereClause = null;
-              if (this.vars.metadata.account.id) {
-                whereClause = `ID = '${this.vars.metadata.account.id}'`;
-              }
-              com.veeva.clm.queryRecord("Account", ["ID", "Name", "Salutation", "RecordtypeID"], whereClause, [], null, (data) => {
-                if (data.success) {
-                  resolve(data.Account);
-                } else {
-                  util.log(`clm.getDataForContextObjects: failed to retrieve Account(s) ${data.message}`, "error");
-                  resolve();
-                }
-              });
-            });
+            let accountConditions = this.vars.metadata.account.id ? [{ field: "id", value: this.vars.metadata.account.id }] : [];
+            let accountResult = await crm.query("account", ["id", "name", "salutation", "typeId"], accountConditions);
+            if (!accountResult.success) queryFailed = true;
+            let accountRecords = accountResult.records;
 
-            //query RecordType object for retrieved account(s)
-            let recordTypeRecords = await new Promise((resolve) => {
-              let whereClause = null;
-              let uniqueRecordTypeIds = [...new Set(accountRecords.map((account) => account.RecordtypeID).filter((id) => id))];
-              if (uniqueRecordTypeIds.length > 0) {
-                uniqueRecordTypeIds.forEach((id) => {
-                  whereClause = whereClause ? `${whereClause} OR ID = '${id}'` : `ID = '${id}'`;
-                });
-              }
-              com.veeva.clm.queryRecord("RecordType", ["ID", "Name"], whereClause, [], null, (data) => {
-                if (data.success) {
-                  resolve(data.RecordType);
-                } else {
-                  util.log(`clm.getDataForContextObjects: failed to retrieve Recordtype(s) ${data.message}`, "error");
-                  resolve();
-                }
-              });
-            });
+            //query account types of the retrieved account(s)
+            let typeIds = [...new Set(accountRecords.map((account) => account.typeId).filter((id) => id))];
+            let typeConditions = [{ field: "objectName", value: "account" }];
+            if (typeIds.length > 0) typeConditions.push({ field: "id", value: typeIds });
+            let typeResult = await crm.query("accountType", ["id", "name", "key"], typeConditions);
+            if (!typeResult.success) queryFailed = true;
 
-            //map RecordType names to account(s)
+            //map account type label and key to account(s)
             accountRecords.forEach((account) => {
-              let recordType = recordTypeRecords.find((rt) => rt.ID == account.RecordtypeID);
-              if (recordType) {
-                account.recordTypeName = recordType.Name;
-              } else {
-                account.recordTypeName = null;
-              }
+              let accountType = typeResult.records.find((type) => type.id == account.typeId);
+              account.recordTypeName = accountType ? accountType.name : null;
+              account.type = accountType ? accountType.key : null;
             });
 
             //store in vars and session data
             if (this.vars.session.isAnActualCall) {
               //current account (call mode only)
               let currentAccount = accountRecords.find((account) => {
-                return account.ID == this.vars.metadata.account.id;
+                return account.id == this.vars.metadata.account.id;
               });
               if (currentAccount) {
-                this.vars.metadata.account.name = currentAccount.Name;
-                this.vars.metadata.account.salutation = currentAccount.Salutation;
+                this.vars.metadata.account.name = currentAccount.name;
+                this.vars.metadata.account.salutation = currentAccount.salutation;
                 this.vars.metadata.account.recordTypeName = currentAccount.recordTypeName;
+                this.vars.metadata.account.type = currentAccount.type;
               }
 
               sessionData.metadata.call.account = JSON.parse(JSON.stringify(this.vars.metadata.account));
-              sessionData.metadata.call.cached = true;
+              sessionData.metadata.call.cached = !queryFailed;
             } else {
               //all accounts (media mode only)
               let accountRecordTemplate = this.vars.metadata.allAccounts.splice(0)[0];
               accountRecords.forEach((accountRecord) => {
                 let newAccountRecord = JSON.parse(JSON.stringify(accountRecordTemplate));
-                newAccountRecord.id = accountRecord.ID;
-                newAccountRecord.name = accountRecord.Name;
-                newAccountRecord.salutation = accountRecord.Salutation;
+                newAccountRecord.id = accountRecord.id;
+                newAccountRecord.name = accountRecord.name;
+                newAccountRecord.salutation = accountRecord.salutation;
                 newAccountRecord.recordTypeName = accountRecord.recordTypeName;
+                newAccountRecord.type = accountRecord.type;
                 this.vars.metadata.allAccounts.push(newAccountRecord);
               });
 
               sessionData.metadata.accounts.allAccounts = JSON.parse(JSON.stringify(this.vars.metadata.allAccounts));
-              sessionData.metadata.accounts.cached = true;
+              sessionData.metadata.accounts.cached = !queryFailed;
             }
 
             storage.sessionData.update()
@@ -27793,125 +28502,29 @@ const clm = {
             this.vars.metadata.keyMessage = JSON.parse(JSON.stringify(sessionData.metadata.media.keyMessage));
             if (detailedLog) util.log("clm.getDataForContextObjects() >> using cached key message data");
           } else {
-            //Presentation (ID, name, status, version)
-            {
-              //ID
-              await new Promise((resolve) => {
-                com.veeva.clm.getDataForCurrentObject("Presentation", "ID", (data) => {
-                  if (data.success) {
-                    this.vars.metadata.presentation.id = data.Presentation.ID;
-                    resolve();
-                  }
-                });
-              });
-              //Name
-              await new Promise((resolve) => {
-                com.veeva.clm.getDataForCurrentObject("Presentation", "Name", (data) => {
-                  if (data.success) {
-                    this.vars.metadata.presentation.name = data.Presentation.Name;
-                    resolve();
-                  }
-                });
-              });
-              //Status
-              await new Promise((resolve) => {
-                com.veeva.clm.getDataForCurrentObject("Presentation", "Status_vod__c", (data) => {
-                  if (data.success) {
-                    this.vars.metadata.presentation.status = data.Presentation.Status_vod__c;
-                    resolve();
-                  }
-                });
-              });
-              //Vault Doc ID
-              await new Promise((resolve) => {
-                com.veeva.clm.getDataForCurrentObject("Presentation", "Vault_Doc_ID_vod__c", (data) => {
-                  if (data.success) {
-                    this.vars.metadata.presentation.vaultDocID = data.Presentation.Vault_Doc_ID_vod__c;
-                    resolve();
-                  }
-                });
-              });
-              //Version
-              await new Promise((resolve) => {
-                com.veeva.clm.getDataForCurrentObject("Presentation", "Version_vod__c", (data) => {
-                  if (data.success) {
-                    this.vars.metadata.presentation.version = data.Presentation.Version_vod__c;
-                    resolve();
-                  }
-                });
-              });
-
-              if (detailedLog) util.log("clm.getDataForContextObjects() >> read presentation");
+            //presentation (id, name, status, Vault doc id, version)
+            let presentation = await crm.getCurrent("presentation", ["id", "name", "status", "vaultDocId", "version"]);
+            if (presentation) {
+              this.vars.metadata.presentation.id = presentation.id;
+              this.vars.metadata.presentation.name = presentation.name;
+              this.vars.metadata.presentation.status = presentation.status;
+              this.vars.metadata.presentation.vaultDocID = presentation.vaultDocId;
+              this.vars.metadata.presentation.version = presentation.version;
             }
+            if (detailedLog) util.log("clm.getDataForContextObjects() >> read presentation");
 
-            //Key_Message_vod__c (ID, file name, disable actions and ios resolution)
-            {
-              //ID
-              await new Promise((resolve) => {
-                com.veeva.clm.getDataForCurrentObject("KeyMessage", "ID", (data) => {
-                  if (data.success) {
-                    this.vars.metadata.keyMessage.id = data.KeyMessage.ID;
-                    resolve();
-                  }
-                });
-              });
-              //key message media file name
-              await new Promise((resolve) => {
-                com.veeva.clm.getDataForCurrentObject("KeyMessage", "Media_File_Name_vod__c", (data) => {
-                  if (data.success) {
-                    this.vars.metadata.keyMessage.mediaFileName = data.KeyMessage.Media_File_Name_vod__c;
-                    resolve();
-                  }
-                });
-              });
-              //key message disable actions
-              await new Promise((resolve) => {
-                com.veeva.clm.getDataForCurrentObject("KeyMessage", "Disable_Actions_vod__c", (data) => {
-                  if (data.success) {
-                    this.vars.metadata.keyMessage.disableActions = data.KeyMessage.Disable_Actions_vod__c;
-                    resolve();
-                  }
-                });
-              });
-              //key message iOS resolution
-              await new Promise((resolve) => {
-                com.veeva.clm.getDataForCurrentObject("KeyMessage", "iOS_Resolution_vod__c", (data) => {
-                  if (data.success) {
-                    this.vars.metadata.keyMessage.iOSResolution = data.KeyMessage.iOS_Resolution_vod__c;
-                    resolve();
-                  }
-                });
-              });
-              //key message Vault Doc ID
-              await new Promise((resolve) => {
-                com.veeva.clm.getDataForCurrentObject("KeyMessage", "Vault_Doc_ID_vod__c", (data) => {
-                  if (data.success) {
-                    this.vars.metadata.keyMessage.vaultDocID = data.KeyMessage.Vault_Doc_ID_vod__c;
-                    resolve();
-                  }
-                });
-              });
-              //key message status
-              await new Promise((resolve) => {
-                com.veeva.clm.getDataForCurrentObject("KeyMessage", "Status_vod__c", (data) => {
-                  if (data.success) {
-                    this.vars.metadata.keyMessage.status = data.KeyMessage.Status_vod__c;
-                    resolve();
-                  }
-                });
-              });
-              //key message slide version
-              await new Promise((resolve) => {
-                com.veeva.clm.getDataForCurrentObject("KeyMessage", "Slide_Version_vod__c", (data) => {
-                  if (data.success) {
-                    this.vars.metadata.keyMessage.slideVersion = data.KeyMessage.Slide_Version_vod__c;
-                    resolve();
-                  }
-                });
-              });
-
-              if (detailedLog) util.log("clm.getDataForContextObjects() >> read key message");
+            //key message (id, file name, disable actions, iOS resolution, Vault doc id, status, slide version)
+            let keyMessage = await crm.getCurrent("keyMessage", ["id", "mediaFileName", "disableActions", "iosResolution", "vaultDocId", "status", "slideVersion"]);
+            if (keyMessage) {
+              this.vars.metadata.keyMessage.id = keyMessage.id;
+              this.vars.metadata.keyMessage.mediaFileName = keyMessage.mediaFileName;
+              this.vars.metadata.keyMessage.disableActions = keyMessage.disableActions;
+              this.vars.metadata.keyMessage.iOSResolution = keyMessage.iosResolution;
+              this.vars.metadata.keyMessage.vaultDocID = keyMessage.vaultDocId;
+              this.vars.metadata.keyMessage.status = keyMessage.status;
+              this.vars.metadata.keyMessage.slideVersion = keyMessage.slideVersion;
             }
+            if (detailedLog) util.log("clm.getDataForContextObjects() >> read key message");
 
             //store in session data
             sessionData.metadata.media.presentation = JSON.parse(JSON.stringify(this.vars.metadata.presentation));
@@ -27930,7 +28543,7 @@ const clm = {
 
         /*get CRM IDs for approved email documents -------------------------------------------------------*/
         {
-          //Approved_Document_vod__c for email cart and non email cart (get crmID for templates and fragments)
+          //approved documents for email cart and non email cart (get crmID for templates and fragments)
           if (this.vars.emailCart.active || this.vars.rteBuilder.active) {
             //array of items: emailCart templates and fragments / non emailCart (interactionSummary) templates and fragments
             let itemsArray = []; //{ id: "", vaultId: "", group: "", __this: {}}
@@ -28065,48 +28678,36 @@ const clm = {
                 let sessionItem = sessionData.approvedDocuments.items.find((sessionItem) => {
                   return sessionItem.group == item.group && sessionItem.id == item.id;
                 });
-                //assign crmId and available flag from session data
-                if (sessionItem) {
+                //assign crmId and available flag from session data (failed lookups are cached with crmId null)
+                if (sessionItem && sessionItem.crmId) {
                   item.__this.crmId = sessionItem.crmId; //set crmId
                   item.__this.available = true; //set available flag
                 }
               }
               if (detailedLog) util.log("clm.getDataForContextObjects() >> using cached crmID data");
             } else {
-              let needToUpdateSessionData = false;
+              //each failed lookup shows a native alert in Vault CRM: look up once per session, caching failures too
               for (let item of itemsArray) {
-                await new Promise((resolve) => {
-                  const vaultURL = item.group.startsWith("rteBuilder")
-                    ? this.vars.rteBuilder.vaultURL
-                    : this.vars.emailCart.vaultURL;
-                  com.veeva.clm.getApprovedDocument(vaultURL, item.vaultId, (data) => {
-                    if (data.success && data.Approved_Document_vod__c) {
-                      let thisItem = item.__this; //reference to original item
-                      thisItem.crmId = data.Approved_Document_vod__c.ID; //set crmId
-                      thisItem.available = true; //set available flag
+                const vaultURL = item.group.startsWith("rteBuilder") ? this.vars.rteBuilder.vaultURL : this.vars.emailCart.vaultURL;
+                let crmId = await crm.approvedDocumentId(vaultURL, item.vaultId);
 
-                      needToUpdateSessionData = true;
-                      sessionData.approvedDocuments.items.push({
-                        group: item.group,
-                        id: item.id,
-                        vaultId: item.vaultId,
-                        crmId: data.Approved_Document_vod__c.ID,
-                      }); //store in session data
-                    } else {
-                      util.log(
-                        `clm.getDataForContextObjects: could not retrieve CRM ID for ${item.id} (${item.group}): ${item.vaultId} + ${vaultURL}`,
-                        "error",
-                      );
-                      util.log(data.message);
-                    }
-                    resolve();
-                  });
-                });
+                sessionData.approvedDocuments.items.push({
+                  group: item.group,
+                  id: item.id,
+                  vaultId: item.vaultId,
+                  crmId: crmId,
+                }); //store in session data
+
+                if (crmId) {
+                  let thisItem = item.__this; //reference to original item
+                  thisItem.crmId = crmId; //set crmId
+                  thisItem.available = true; //set available flag
+                } else {
+                  util.log(`clm.getDataForContextObjects: could not retrieve CRM ID for ${item.id} (${item.group}): ${item.vaultId} + ${vaultURL}`, "error");
+                }
               }
-              if (needToUpdateSessionData) {
-                sessionData.approvedDocuments.cached = true;
-                storage.sessionData.update()
-              }
+              sessionData.approvedDocuments.cached = true;
+              storage.sessionData.update()
               if (detailedLog) util.log("clm.getDataForContextObjects() >> read crmIDs");
             }
           }
@@ -28136,44 +28737,25 @@ const clm = {
                 { type: "Key Message", vaultId: relatedItem.vaultExternalID.keyMessage, available: null },
               ];
               for (let thisId of idsToCheck) {
-                await new Promise((resolve) => {
-                  com.veeva.clm.queryRecord(
-                    thisId.type == "Presentation" ? "Clm_Presentation_vod__c" : "Key_Message_vod__c",
-                    ["ID", "Name", "Status_vod__c"],
-                    `Vault_External_Id_vod__c = "${thisId.vaultId}"`,
-                    [],
-                    null,
-                    (data) => {
-                      if (data.success) {
-                        let foundApproved = data[thisId.type == "Presentation" ? "Clm_Presentation_vod__c" : "Key_Message_vod__c"].find((item) => {
-                          return item.Status_vod__c == "Approved_vod";
-                        });
-                        let foundStaged = data[thisId.type == "Presentation" ? "Clm_Presentation_vod__c" : "Key_Message_vod__c"].find((item) => {
-                          return item.Status_vod__c == "Staged_vod";
-                        });
-                        if (!foundApproved && !foundStaged) {
-                          util.log(
-                            `clm.getDataForContextObjects: related CLM ${relatedItem.id} / no approved or staged record found for ${thisId.type} ${thisId.vaultId}`,
-                            "error",
-                          );
-                        }
-                        if (foundStaged && !foundApproved) {
-                          util.log(
-                            `clm.getDataForContextObjects: related CLM ${relatedItem.id} / no approved (just staged) record found for ${thisId.type} ${thisId.vaultId}`,
-                            "error",
-                          );
-                        }
-                        if (foundApproved || foundStaged) {
-                          //partial: mark presentation or key message as available
-                          thisId.available = true;
-                        }
-                      } else {
-                        util.log(`clm.getDataForContextObjects: failed to retrieve ${thisId.type} ${thisId.vaultId}: ${data.message}`, "error");
-                      }
-                      resolve();
-                    },
-                  );
-                });
+                let result = await crm.query(thisId.type == "Presentation" ? "presentation" : "keyMessage", ["id", "name", "status"], [
+                  { field: "vaultExternalId", value: thisId.vaultId },
+                ]);
+                if (result.success) {
+                  let foundApproved = result.records.find((item) => item.status == "approved");
+                  let foundStaged = result.records.find((item) => item.status == "staged");
+                  if (!foundApproved && !foundStaged) {
+                    util.log(`clm.getDataForContextObjects: related CLM ${relatedItem.id} / no approved or staged record found for ${thisId.type} ${thisId.vaultId}`, "error");
+                  }
+                  if (foundStaged && !foundApproved) {
+                    util.log(`clm.getDataForContextObjects: related CLM ${relatedItem.id} / no approved (just staged) record found for ${thisId.type} ${thisId.vaultId}`, "error");
+                  }
+                  if (foundApproved || foundStaged) {
+                    //partial: mark presentation or key message as available
+                    thisId.available = true;
+                  }
+                } else {
+                  util.log(`clm.getDataForContextObjects: failed to retrieve ${thisId.type} ${thisId.vaultId}: ${result.message}`, "error");
+                }
               }
               if (idsToCheck[0].available && idsToCheck[1].available) {
                 //mark related item as available (both presentation and key message are available)
@@ -28221,6 +28803,8 @@ const clm = {
         this.vars.metadata.account.salutation = "Dr.";
         this.vars.metadata.account.recordTypeName = "Professional";
       }
+      //neutral account type key from the label, as the crm module derives it: "Hospital Department" -> "hospitaldepartment"
+      this.vars.metadata.account.type = this.vars.metadata.account.recordTypeName ? String(this.vars.metadata.account.recordTypeName).replace(/[\s_]/g, "").toLowerCase() : null;
     } else {
       //media: multiple accounts
       let accountsCount = Math.floor(Math.random() * (maxAccounts - minAccounts + 1)) + minAccounts;
@@ -28432,6 +29016,7 @@ const clm = {
         accountRecord.name = accountName;
         accountRecord.salutation = accountSalutation;
         accountRecord.recordTypeName = accountRecordType;
+        accountRecord.type = accountRecordType.toLowerCase();
 
         accountRecords.push(accountRecord);
       }
@@ -28439,7 +29024,7 @@ const clm = {
       this.vars.metadata.allAccounts = accountRecords;
     }
 
-    //Approved_Document_vod__c crmId (browserMode only) --------------------------------------------------------------
+    //approved document crmId (browserMode only) --------------------------------------------------------------
     if (this.vars.emailCart.active || this.vars.rteBuilder.active) {
       let crmIdCount = 0;
       if (this.vars.emailCart.active) {
@@ -28637,8 +29222,8 @@ const clm = {
       }
       window.location.replace(path);
     } else {
-      //Veeva library code
-      com.veeva.clm.gotoSlide(this.findSlide(slideId).player.zipName);
+      //CRM library
+      crm.gotoSlide(this.findSlide(slideId).player.zipName);
     }
   },
   goNextSlide: function () {
@@ -28648,7 +29233,7 @@ const clm = {
       this.vars.navigation.dynamicPresentation.source == "myPresentations" &&
       this.vars.navigation.dynamicPresentation.isMixed
     ) {
-      com.veeva.clm.nextSlide();
+      crm.nextSlide();
       return;
     }
 
@@ -28671,7 +29256,7 @@ const clm = {
       this.vars.navigation.dynamicPresentation.source == "myPresentations" &&
       this.vars.navigation.dynamicPresentation.isMixed
     ) {
-      com.veeva.clm.prevSlide();
+      crm.prevSlide();
       return;
     }
 
@@ -28820,7 +29405,7 @@ const clm = {
 
     // Execute navigation
     if (!vars.options.browserMode.active) {
-      com.veeva.clm.gotoSlideV2(targetKeyMessage, targetPresentation);
+      crm.gotoSlideV2(targetKeyMessage, targetPresentation);
     } else {
       // Browser mode navigation using localPath
       if (relatedCLM.localPath) {
@@ -28852,130 +29437,69 @@ const clm = {
         }
 
         //get account ID
-        let accountId = await new Promise((resolve) => {
-          com.veeva.clm.getDataForCurrentObject("Account", "ID", (data) => {
-            if (data.success) {
-              resolve(data.Account.ID);
-            } else {
-              resolve();
-            }
-          });
-        });
+        let account = await crm.getCurrent("account", "id");
+        let accountId = account ? account.id : null;
 
         if (!accountId) {
           resolve(); //unable to retrieve account >> media mode
+          return;
         }
 
         //get params
         let type = this.vars.dynamicPresentation.source.contentTargeting.type;
         let object = this.vars.dynamicPresentation.source.contentTargeting.object;
+        //custom field: platform field name, either one string or { veeva: "...", vault: "..." }; dynamic attribute: attribute name
         let field = this.vars.dynamicPresentation.source.contentTargeting.field;
+        if (field && typeof field === "object") field = field[crm.platform()];
+        if (!field) {
+          util.log(`clm.contentTargeting: no field configured for ${crm.platform()}`, "error");
+          resolve();
+          return;
+        }
+
+        //comma-separated list -> array
+        const toList = (value) => (value ? String(value).split(",").map((item) => item.trim()) : undefined);
 
         //placeholder for slides sequence input
         let slidesSequenceInput;
 
         //read data
         switch (type) {
-          case "dynamic-attribute":
-            slidesSequenceInput = await new Promise((resolve) => {
-              com.veeva.clm.queryRecord(
-                "Dynamic_Attribute_vod__c",
-                ["Dynamic_Attribute_Value_Text_Area_vod__c"],
-                'WHERE Account_vod__c = "' + accountId + '" AND Dynamic_Attribute_Name_vod__c = "' + field + '"',
-                [],
-                null,
-                (data) => {
-                  if (data.success) {
-                    if (data.Dynamic_Attribute_vod__c.length > 0) {
-                      resolve(data.Dynamic_Attribute_vod__c[0].Dynamic_Attribute_Value_Text_Area_vod__c.split(",").map((item) => item.trim()));
-                    } else {
-                      resolve();
-                    }
-                  } else {
-                    resolve();
-                  }
-                },
-              );
-            });
+          case "dynamic-attribute": {
+            let result = await crm.query("dynamicAttribute", ["valueTextArea"], [
+              { field: "accountId", value: accountId },
+              { field: "name", value: field },
+            ]);
+            if (result.records.length > 0) slidesSequenceInput = toList(result.records[0].valueTextArea);
             break;
+          }
           case "custom-field":
             switch (object) {
-              case "Account":
-                slidesSequenceInput = await new Promise((resolve) => {
-                  com.veeva.clm.getDataForCurrentObject("Account", field, (data) => {
-                    if (data.success) {
-                      resolve(data.Account[field].split(",").map((item) => item.trim()));
-                    } else {
-                      resolve();
-                    }
-                  });
-                });
+              case "account": {
+                let current = await crm.getCurrent("account", field);
+                if (current) slidesSequenceInput = toList(current[field]);
                 break;
-              case "TSF_vod__c":
-                //get user ID
-                let userId = await new Promise((resolve) => {
-                  com.veeva.clm.getDataForCurrentObject("User", "ID", (data) => {
-                    if (data.success) {
-                      resolve(data.User.ID);
-                    } else {
-                      resolve();
-                    }
-                  });
-                });
+              }
+              case "tsf": {
+                //territory of the user
+                let user = await crm.getCurrent("user", "id");
+                let userTerritory = user ? await crm.query("userTerritory", ["territoryId"], [{ field: "userId", value: user.id }]) : null;
+                let territoryId = userTerritory && userTerritory.records.length > 0 ? userTerritory.records[0].territoryId : null;
+                let territory = territoryId ? await crm.query("territory", ["name"], [{ field: "id", value: territoryId }]) : null;
+                let territoryName = territory && territory.records.length > 0 ? territory.records[0].name : null;
 
-                //get territory id
-                let territoryId = await new Promise((resolve) => {
-                  com.veeva.clm.queryRecord("UserTerritory2Association", ["UserId", "Territory2Id"], "WHERE UserId = '" + userId + "'", [], null, (data) => {
-                    if (data.success) {
-                      if (data.UserTerritory2Association.length > 0) {
-                        resolve(data.UserTerritory2Association[0].Territory2Id);
-                      } else {
-                        resolve();
-                      }
-                    } else {
-                      resolve();
-                    }
-                  });
-                });
-
-                //get territory name
-                let territoryName = await new Promise((resolve) => {
-                  com.veeva.clm.queryRecord("Territory2", ["Name"], "WHERE ID = '" + territoryId + "'", [], null, (data) => {
-                    if (data.success) {
-                      if (data.Territory2.length > 0) {
-                        resolve(data.Territory2[0].Name);
-                      } else {
-                        resolve();
-                      }
-                    } else {
-                      resolve();
-                    }
-                  });
-                });
-
-                //get TSF record for the account
-                slidesSequenceInput = await new Promise((resolve) => {
-                  com.veeva.clm.queryRecord(
-                    "TSF_vod__c",
-                    ["Territory_vod__c, Account_vod__c, " + field],
-                    "WHERE Account_vod__c = '" + accountId + "' AND Territory_vod__c = '" + territoryName + "'",
-                    [],
-                    null,
-                    (data) => {
-                      if (data.success) {
-                        if (data.TSF_vod__c.length > 0) {
-                          resolve(data.TSF_vod__c[0][field].split(",").map((item) => item.trim()));
-                        } else {
-                          resolve();
-                        }
-                      } else {
-                        resolve();
-                      }
-                    },
-                  );
-                });
-
+                //TSF record of the account in that territory
+                if (territoryName) {
+                  let tsf = await crm.query("tsf", ["territoryName", "accountId", field], [
+                    { field: "accountId", value: accountId },
+                    { field: "territoryName", value: territoryName },
+                  ]);
+                  if (tsf.records.length > 0) slidesSequenceInput = toList(tsf.records[0][field]);
+                }
                 break;
+              }
+              default:
+                util.log(`clm.contentTargeting: unknown object "${object}" (account or tsf)`, "error");
             }
             break;
         }
@@ -29016,49 +29540,28 @@ const clm = {
         }
 
         //get presentation ID
-        let presentationId = await new Promise((resolve) => {
-          com.veeva.clm.getDataForCurrentObject("Presentation", "ID", (data) => {
-            if (data.success) {
-              resolve(data.Presentation.ID);
-            }
-          });
-        });
+        let presentation = await crm.getCurrent("presentation", "id");
+        let presentationId = presentation ? presentation.id : null;
 
-        //get key messages IDs
-        let keyMessageIds = await new Promise((resolve) => {
-          com.veeva.clm.queryRecord(
-            "Clm_Presentation_Slide_vod__c",
-            ["Key_Message_vod__c"],
-            `Clm_Presentation_vod__c = "${presentationId}"`,
-            ["Display_Order_vod__c, ASC"],
-            null,
-            (data) => {
-              if (data.success) {
-                resolve(data.Clm_Presentation_Slide_vod__c.map((item) => item.Key_Message_vod__c));
-              }
-            },
-          );
-        });
+        if (!presentationId) {
+          resolve();
+          return;
+        }
+
+        //get key messages IDs, in presentation order
+        let slides = await crm.query("presentationSlide", ["keyMessageId"], [{ field: "presentationId", value: presentationId }], [{ field: "displayOrder", dir: "ASC" }]);
+        let keyMessageIds = slides.records.map((item) => item.keyMessageId);
+
+        if (keyMessageIds.length == 0) {
+          resolve();
+          return;
+        }
 
         //get key messages zip names
-        let keyMessageZipNames = await new Promise((resolve) => {
-          let whereClause = keyMessageIds
-            .map((item) => {
-              return `ID = "${item}" OR`;
-            })
-            .join(" ")
-            .slice(0, -3);
-
-          com.veeva.clm.queryRecord("Key_Message_vod__c", ["ID", "Media_File_Name_vod__c"], whereClause, [], null, (data) => {
-            if (data.success) {
-              resolve(
-                data.Key_Message_vod__c.sort((a, b) => {
-                  return keyMessageIds.indexOf(a.ID) - keyMessageIds.indexOf(b.ID); //sort data.Key_Message_vod__c by keyMessageIds
-                }).map((item) => item.Media_File_Name_vod__c),
-              ); //keep just the zip name
-            }
-          });
-        });
+        let keyMessages = await crm.query("keyMessage", ["id", "mediaFileName"], [{ field: "id", value: keyMessageIds }]);
+        let keyMessageZipNames = keyMessages.records
+          .sort((a, b) => keyMessageIds.indexOf(a.id) - keyMessageIds.indexOf(b.id)) //sort by keyMessageIds
+          .map((item) => item.mediaFileName); //keep just the zip name
 
         //set standard presentation zip names array for comparison
         let standardPresZips = this.vars.slides.map((item) => item.player.zipName);
@@ -29369,10 +29872,10 @@ const clm = {
         return new Promise((resolve, reject) => {
           if (detailedLog) util.log("clm.mediaDetectionIntervalStart: checking for call ID change");
 
-          com.veeva.clm.getDataForCurrentObject("Call", "ID", (data) => {
-            if (data.success) {
+          crm.getCurrent("call", "id", { quiet: true }).then((call) => {
+            if (call && call.id) {
               //obtained call id
-              let newCallID = data.Call.ID;
+              let newCallID = call.id;
 
               //clear interval
               clm.mediaDetectionIntervalStop();
@@ -29660,6 +30163,7 @@ const clm = {
   global.com.idc.inspector = inspector;
   global.com.idc.clm = clm;
   global.com.idc.util = util;
+  global.com.idc.crm = crm;
   global.com.idc.storage = storage;
   global.com.idc.ui = ui;
   global.com.idc.interactionSummary = interactionSummary;

@@ -858,6 +858,7 @@ let com_idc_params = {
       "flowSlidesRequired": "Please add at least one slide to the flow",
       "flowSavedConfirmation": "Flow saved successfully",
       "flowNotFound": "Flow not found",
+      "flowSaveFailed": "Your flows could not be saved. Changes may be lost when the app is closed.",
       "flowSaved": "Flow saved!",
       "flowUpdated": "Flow updated!",
       "flowDeleted": "Flow deleted",
@@ -990,8 +991,8 @@ let com_idc_params = {
     },
     "persistentMethod": "localStorage",
     "veevaField": {
-      "object": null,
-      "field": null
+      "veeva": null,
+      "vault": null
     }
   },
   "rteBuilder": {
