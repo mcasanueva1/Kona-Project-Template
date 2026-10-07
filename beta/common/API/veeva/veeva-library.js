@@ -1,4 +1,4 @@
-// Veeva JavaScript Library version 241.0.100
+// Veeva JavaScript Library version 242.0.200
 // http://veeva.com
 //
 // Copyright © 2024 Veeva Systems, Inc. All rights reserved.
