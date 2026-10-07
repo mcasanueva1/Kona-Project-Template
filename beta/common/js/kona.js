@@ -1,6 +1,6 @@
 "use strict";
 
-const BUILD_ID = "kona library __20261007-142730-6kxg4h2__";
+const BUILD_ID = "kona library __20261007-163240-ec4b2ag__";
 console.log("%cBuild:", "color:#888", BUILD_ID);
 
 (function (global) {
@@ -23114,6 +23114,7 @@ const storage = {
     envelopeMark: "persistentData", // envelope.kona value: tells Kona's field values from foreign ones
     mirrorSuffix: "_PERSISTENT",     // sessionStorage key suffix for the veevaField session mirror
     matchObjects: { currentUser: "user", currentPresentation: "presentation", currentAccount: "account" },
+    placeholder: /##(currentUser|currentPresentation|currentAccount|now)##/g, // in veevaField values
   },
 
   /* INIT -------------------------------------------------*/
@@ -23213,8 +23214,16 @@ const storage = {
       util.log(`[storage.init] persistentMethod "veevaField" needs storage.veevaField.${platform} with object, field and match - using localStorage`, 'error');
       return null;
     }
+    // values (optional): extra fields set when Kona creates its record, e.g. a required Name
+    const valuesOk = cfg.values == null || (typeof cfg.values === 'object' && !Array.isArray(cfg.values) &&
+      Object.keys(cfg.values).every(k => typeof cfg.values[k] === 'string'));
+    if (!valuesOk) {
+      util.log(`[storage.init] storage.veevaField.${platform}.values must map field names to text - using localStorage`, 'error');
+      return null;
+    }
     const fields = { value: cfg.field };
     cfg.match.forEach(m => { fields[m.field] = m.field; });
+    Object.keys(cfg.values || {}).forEach(k => { fields[k] = k; });
     crm.registerObject('persistentStore', cfg.object, fields);
     return cfg;
   },
@@ -23524,25 +23533,36 @@ const storage = {
           return parsed;
         },
 
-        // match tokens -> ids (currentUser / currentPresentation / currentAccount); other values are used as they are
+        // match tokens -> ids (currentUser / currentPresentation / currentAccount); other values are used as they are.
+        // Ids used only as ##placeholders## in values are resolved too
         resolveMatch: async function() {
           const vf = storage.state.veevaField;
+          const tokens = vf.target.match.map(m => m.value);
+          Object.keys(vf.target.values || {}).forEach(k => {
+            (vf.target.values[k].match(storage.constants.placeholder) || []).forEach(p => tokens.push(p.slice(2, -2)));
+          });
           const values = {};
-          for (const m of vf.target.match) {
-            if (Object.prototype.hasOwnProperty.call(values, m.value)) continue;
-            const object = storage.constants.matchObjects[m.value];
+          for (const token of tokens) {
+            if (token === 'now' || Object.prototype.hasOwnProperty.call(values, token)) continue;
+            const object = storage.constants.matchObjects[token];
             if (!object) {
-              values[m.value] = m.value;
+              values[token] = token;
               continue;
             }
             const current = await crm.getCurrent(object, ['id']);
             if (!current || !current.id) {
-              util.log(`[storage.veevaField] ${m.value} id not available`, 'error');
+              util.log(`[storage.veevaField] ${token} id not available`, 'error');
               return null;
             }
-            values[m.value] = current.id;
+            values[token] = current.id;
           }
           return values;
+        },
+
+        // "Kona ##currentUser## ##now##" -> "Kona 005xx 1760000000000"
+        fillPlaceholders: function(text, now) {
+          const ids = storage.state.veevaField.matchValues || {};
+          return text.replace(storage.constants.placeholder, (all, token) => (token === 'now' ? String(now) : (ids[token] == null ? '' : ids[token])));
         },
 
         conditions: function() {
@@ -23587,6 +23607,7 @@ const storage = {
           } else {
             const values = { value: text };
             vf.target.match.forEach(m => { values[m.field] = vf.matchValues[m.value]; });
+            Object.keys(vf.target.values || {}).forEach(k => { values[k] = this.fillPlaceholders(vf.target.values[k], savedAt); });
             result = await crm.create('persistentStore', values);
             if (result.success && result.id) vf.recordId = result.id;
           }
