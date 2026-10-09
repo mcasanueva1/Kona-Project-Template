@@ -1,6 +1,6 @@
 "use strict";
 
-const BUILD_ID = "kona library __20260130-122042-3c0a7ae__";
+const BUILD_ID = "kona library __20260825-155025-0f0eee6__";
 console.log(BUILD_ID);
 
 if (com == null) var com = {};
