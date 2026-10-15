@@ -1,6 +1,6 @@
 "use strict";
 
-const BUILD_ID = "kona library __20261007-163240-ec4b2ag__";
+const BUILD_ID = "kona library __20261015-201703-yhqt6w2__";
 console.log("%cBuild:", "color:#888", BUILD_ID);
 
 (function (global) {
@@ -4051,12 +4051,7 @@ const ui = {
               //target CLM id
               let targetCLMId = util.getElementAttribute(el, "data-target-clm");
 
-              //track
-              if (vars.utilitiesMenu.clickstreamTracking.active) {
-                this.track(targetCLMId);
-              }
-
-              //goto CLM
+              //goto CLM (clm.gotoRelatedCLM() records the clickstream)
               if (targetCLMId != "") {
                 clm.gotoRelatedCLM(targetCLMId);
               }
@@ -5902,11 +5897,15 @@ const smartNext = {
       // Hand the item's variant (if any) to the target slide: clm.setBodyVars() turns it into
       // <body data-variant="..."> on load, which the slide's multi/tab resolves via selectorAttribute.
       // Matched by keyMessage, or by slideId inside this presentation when there is no keyMessage.
+      // Session data is per presentation, so another presentation gets it as a targeted flowVariant message instead.
       if (!clm.sessionData.customFlows) clm.sessionData.customFlows = {}; // session stored before this key existed
-      clm.sessionData.customFlows.activeVariant = item.variant
+      clm.sessionData.customFlows.activeVariant = item.variant && isCurrentPres
         ? { keyMessage: item.keyMessage || null, slideId: localSlide ? localSlide.id : null, variant: item.variant }
         : null;
       storage.sessionData.update();
+      if (item.variant && !isCurrentPres && item.keyMessage && typeof messenger !== 'undefined' && messenger.api && messenger.api.sendTargeted) {
+        messenger.api.sendTargeted(item.presentation.replace('https://', ''), 'flowVariant', { keyMessage: item.keyMessage, variant: item.variant });
+      }
 
       // Helper: send targeted pdfPage message to a different presentation
       const sendPdfPageMessage = function () {
@@ -9383,7 +9382,7 @@ const interactionSummary = {
       const fields = interactionSummary.fields;
 
       //set processing flag
-      output.processing = false;
+      output.processing = true;
 
       // disable cache flag for testing purposes
       const forceDisabledCache = false;
@@ -10264,7 +10263,7 @@ const interactionSummary = {
                             fragment = vars.emailCart.fragments.find((fragment) => fragment.crmId == fragmentID);
                           } else if (templateType == "rteBuilder") {
                             fragment = vars.rteBuilder.fragments.find((fragment) => fragment.crmId == fragmentID);
-                          } else if (templateType = "nonEmailCartItems") {
+                          } else if (templateType == "nonEmailCartItems") {
                             fragment = template.fragments.find((fragment) => fragment.crmId == fragmentID);
                           }
                           if (!fragment) return;
@@ -10708,7 +10707,7 @@ const interactionSummary = {
                         callKeyMessageRecords.forEach((callKeyMessage) => {
                           //zip file record for this key message
                           let zipFileIndex = record.zipFiles.findIndex((zipFile) => {
-                            return zipFile.name == callKeyMessage.keyMessage.mediaFileName;
+                            return zipFile.zip == callKeyMessage.keyMessage.mediaFileName;
                           });
                           if (zipFileIndex < 0) {
                             let newZipFileRecord = JSON.parse(JSON.stringify(zipFileTemplate));
@@ -11003,7 +11002,12 @@ const interactionSummary = {
           util.log(`clm.interactionSummaryDataModel() - (${pAccountId ? vars.metadata.account.id + " account)" : "all accounts)"}`);
 
           resolve();
-        })();
+        })().catch((error) => {
+          //a failed build must not leave the processing flag set, or no later call would retry it
+          output.processing = false;
+          util.log(`interactionSummary.api.generateDataModel: failed ${error && error.message}`, "error");
+          resolve();
+        });
       });
     },
     generateTestData: function () {
@@ -26654,9 +26658,9 @@ const clm = {
         allAccounts: [],
       },
       media: {
-        cached: null,
+        cached: null, // presentation read
         presentation: {},
-        keyMessage: {},
+        keyMessages: {}, // slide id -> key message (each slide has its own)
       },
       slides: {
         cached: null,
@@ -28516,12 +28520,14 @@ const clm = {
 
         /*get media-related metadata (presentation, key message) -----------------------------------------*/
         {
-          if (sessionData.metadata.media.cached && !forceDisabledCache) {
-            this.vars.metadata.presentation = JSON.parse(JSON.stringify(sessionData.metadata.media.presentation));
-            if (detailedLog) util.log("clm.getDataForContextObjects() >> using cached presentation data");
+          //the presentation is the same for the whole session; the key message is the current slide's, so it is cached per slide
+          let media = sessionData.metadata.media;
+          if (!media.keyMessages) media.keyMessages = {}; //session stored before key messages were cached per slide
+          let slideId = this.vars.navigation.currentSlide.id;
 
-            this.vars.metadata.keyMessage = JSON.parse(JSON.stringify(sessionData.metadata.media.keyMessage));
-            if (detailedLog) util.log("clm.getDataForContextObjects() >> using cached key message data");
+          if (media.cached && !forceDisabledCache) {
+            this.vars.metadata.presentation = JSON.parse(JSON.stringify(media.presentation));
+            if (detailedLog) util.log("clm.getDataForContextObjects() >> using cached presentation data");
           } else {
             //presentation (id, name, status, Vault doc id, version)
             let presentation = await crm.getCurrent("presentation", ["id", "name", "status", "vaultDocId", "version"]);
@@ -28534,6 +28540,15 @@ const clm = {
             }
             if (detailedLog) util.log("clm.getDataForContextObjects() >> read presentation");
 
+            media.presentation = JSON.parse(JSON.stringify(this.vars.metadata.presentation));
+            media.cached = true;
+            storage.sessionData.update();
+          }
+
+          if (media.keyMessages[slideId] && !forceDisabledCache) {
+            this.vars.metadata.keyMessage = JSON.parse(JSON.stringify(media.keyMessages[slideId]));
+            if (detailedLog) util.log("clm.getDataForContextObjects() >> using cached key message data");
+          } else {
             //key message (id, file name, disable actions, iOS resolution, Vault doc id, status, slide version)
             let keyMessage = await crm.getCurrent("keyMessage", ["id", "mediaFileName", "disableActions", "iosResolution", "vaultDocId", "status", "slideVersion"]);
             if (keyMessage) {
@@ -28547,11 +28562,8 @@ const clm = {
             }
             if (detailedLog) util.log("clm.getDataForContextObjects() >> read key message");
 
-            //store in session data
-            sessionData.metadata.media.presentation = JSON.parse(JSON.stringify(this.vars.metadata.presentation));
-            sessionData.metadata.media.keyMessage = JSON.parse(JSON.stringify(this.vars.metadata.keyMessage));
-            sessionData.metadata.media.cached = true;
-            storage.sessionData.update()
+            media.keyMessages[slideId] = JSON.parse(JSON.stringify(this.vars.metadata.keyMessage));
+            storage.sessionData.update();
           }
 
           util.log(
@@ -29200,14 +29212,21 @@ const clm = {
     //The value is consumed (one-shot) so a later navigation to the same slide via menus is not affected;
     //the attribute itself is never removed here so that later setBodyVars() calls on the same page keep it.
     //Matched by keyMessage, or by slideId when the config carries no keyMessage ids (never null === null).
-    const activeVariant = this.sessionData.customFlows ? this.sessionData.customFlows.activeVariant : null;
+    //From another presentation it arrives as a targeted flowVariant message (session data is per presentation).
+    const flowVariant = typeof messenger !== "undefined" && messenger.api && messenger.state.currentPresentationId
+      ? messenger.api.receiveTargeted("flowVariant") : null;
+    const activeVariant = flowVariant && flowVariant.variant
+      ? { keyMessage: flowVariant.keyMessage || null, slideId: null, variant: flowVariant.variant }
+      : (this.sessionData.customFlows ? this.sessionData.customFlows.activeVariant : null);
     const variantByKeyMessage = !!(activeVariant && activeVariant.keyMessage && currentSlide && currentSlide.vaultExternalID
         && currentSlide.vaultExternalID.keyMessage === activeVariant.keyMessage);
     const variantBySlideId = !!(activeVariant && activeVariant.slideId && currentSlide && currentSlide.id === activeVariant.slideId);
     if (activeVariant && activeVariant.variant && (variantByKeyMessage || variantBySlideId)) {
       document.querySelector("body").setAttribute("data-variant", activeVariant.variant);
-      this.sessionData.customFlows.activeVariant = null;
-      storage.sessionData.update();
+      if (this.sessionData.customFlows && this.sessionData.customFlows.activeVariant) {
+        this.sessionData.customFlows.activeVariant = null;
+        storage.sessionData.update();
+      }
     }
   },
 
@@ -29402,6 +29421,11 @@ const clm = {
     } else {
       // No nested target - navigate to parent item's landing slide
       util.log("Jump to external presentation:", relatedCLM.id, targetKeyMessage, targetPresentation);
+    }
+
+    // Clickstream tracking (once per session per item) for every entry point: inline links, Related CLM modal, AI
+    if (vars.utilitiesMenu.clickstreamTracking.active) {
+      ui.core.relatedCLMLink.track(clmId);
     }
 
     // Send PDF page message if navigating to PDF

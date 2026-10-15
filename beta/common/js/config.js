@@ -6,6 +6,7 @@ let com_idc_params = {
       "presentation": "",
     },
     "localPath": "",
+    "jsLibrary": "",
   },
   "options": {
     "debugMode": {
@@ -24,6 +25,7 @@ let com_idc_params = {
                 "Salutation": "Dr.",
                 "Name": "John Smith",
                 "Profile__c": "Progressive",
+                "RecordTypeName": "Professional",
               },
               "User": {
                   "ID": "0050Y000000Yf7EQAS",
@@ -71,8 +73,11 @@ let com_idc_params = {
       "contentTargeting": {
         "active": false,
         "type": "custom-field",
-        "object": "TSF_vod__c",
-        "field": "ContentTargeting__c",
+        "object": "tsf",
+        "field": {
+          "veeva": "ContentTargeting__c",
+          "vault": "contenttargeting__c"
+        },
         "menu": {
           "standard": {
             "id": ""
@@ -183,7 +188,7 @@ let com_idc_params = {
           },
           "sitemapButton": {
             "active": false,
-            "buttoId": null,
+            "buttonId": null,
             "excludeModals": []
           }
         }
@@ -217,7 +222,7 @@ let com_idc_params = {
               },
               "sitemapButton": {
                 "active": false,
-                "buttoId": null,
+                "buttonId": null,
                 "excludeModals": []
               }
             }
@@ -251,7 +256,7 @@ let com_idc_params = {
               },
               "sitemapButton": {
                 "active": false,
-                "buttoId": null,
+                "buttonId": null,
                 "excludeModals": []
               }
             }
@@ -285,7 +290,7 @@ let com_idc_params = {
               },
               "sitemapButton": {
                 "active": false,
-                "buttoId": null,
+                "buttonId": null,
                 "excludeModals": []
               }
             }
@@ -319,7 +324,7 @@ let com_idc_params = {
               },
               "sitemapButton": {
                 "active": false,
-                "buttoId": null,
+                "buttonId": null,
                 "excludeModals": []
               }
             }
@@ -437,50 +442,10 @@ let com_idc_params = {
       }
     },
     "fields": {
-      "Call2_vod__c": [
-        "ID",
-        "Account_vod__c",
-        "Call_Channel_vod__c",
-        "Call_Datetime_vod__c",
-        "Status_vod__c"
-      ],
-      "Call2_Key_Message_vod__c": [
-        "ID",
-        "Account_vod__c",
-        "Call2_vod__c",
-        "Call_Date_vod__c",
-        "Start_Time_vod__c",
-        "Key_Message_vod__c",
-        "Duration_vod__c",
-        "Reaction_vod__c",
-        "Display_Order_vod__c",
-        "Key_Message_Name_vod__c",
-        "Clm_Presentation_Name_vod__c"
-      ],
-      "Sent_Email_vod__c": [
-        "ID",
-        "Account_vod__c",
-        "Email_Fragments_vod__c",
-        "Approved_Email_Template_vod__c",
-        "Email_Sent_Date_vod__c",
-        "Opened_vod__c",
-        "Open_Count_vod__c",
-        "Last_Open_Date_vod__c",
-        "Click_Count_vod__c",
-        "Last_Activity_Date_vod__c",
-        "Approved_Document_Views_vod__c",
-        "Status_vod__c"
-      ],
-      "Email_Activity_vod__c": [
-        "ID",
-        "Sent_Email_vod__c",
-        "Approved_Document_vod__c",
-        "Vault_Doc_ID_vod__c",
-        "Vault_Doc_Name_vod__c",
-        "Vault_Document_Number_vod__c",
-        "Activity_DateTime_vod__c",
-        "Event_type_vod__c"
-      ]
+      "call": ["id", "accountId", "channel", "datetime", "status"],
+      "callKeyMessage": ["id", "accountId", "callId", "callDate", "startTime", "keyMessageId", "duration", "reaction", "displayOrder", "keyMessageName", "presentationName"],
+      "sentEmail": ["id", "accountId", "emailFragments", "emailTemplateId", "sentDate", "opened", "openCount", "lastOpenDate", "clickCount", "lastActivityDate", "documentViews", "status"],
+      "emailActivity": ["id", "sentEmailId", "approvedDocumentId", "vaultDocId", "vaultDocName", "vaultDocumentNumber", "activityDatetime", "eventType"]
     },
     "nonEmailCartItems": {
       "templates": [],
