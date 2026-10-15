@@ -500,7 +500,7 @@ let com_idc_params = {
         "summary_Interactions_multipleInterations": "<strong>Multiple interactions</strong> recorded with this IVA or related materials/RTEs, most recently on ||date||",
         "summary_Slides_noData": "<strong>No activity data</strong> recorded for this IVA",
         "summary_Slides_oneSlide": "<strong>One slide</strong> has been discussed on ||date||",
-        "summary_Slides_multipleSlides": "<strong>Several slides</strong> been discussed, most recently on ||date||",
+        "summary_Slides_multipleSlides": "<strong>Several slides</strong> have been discussed, most recently on ||date||",
         "summary_Slides_nextBestContent": "Next Best Content is available for the next call",
         "summary_Email_noData": "<strong>No emails were sent</strong> from this IVA",
         "summary_Email_oneEmail": "<strong>One email sent</strong> on ||date|| (||status||)",
