@@ -1,6 +1,6 @@
 "use strict";
 
-const BUILD_ID = "kona library __20261020-145018-rj0htnc__";
+const BUILD_ID = "kona library __20261020-211148-t63hit5__";
 console.log("%cBuild:", "color:#888", BUILD_ID);
 
 (function (global) {
@@ -393,6 +393,7 @@ const crm = {
     loggedOnce: {}, //messages logged once per page (unmapped names / values)
     labelCache: {}, //picklist labels by "object.field"
     queue: Promise.resolve(), //serializes library calls (see helpers.call)
+    requestQueue: Promise.resolve(), //serializes library requests (see request)
   },
 
   /* CONSTANTS --------------------------------------------*/
@@ -404,6 +405,7 @@ const crm = {
     },
     maxWhereLength: 1000,
     callTimeout: 15000,
+    requestTimeout: 15000,
   },
 
   /* DRIVERS ----------------------------------------------*/
@@ -420,6 +422,7 @@ const crm = {
     veeva: {
       id: "veeva",
       idField: "ID",
+      httpThroughLibrary: false, //fetch works in the CLM web view
       normalizeKey: (value) => String(value).replace(/_vod$/, "").replace(/_/g, "").toLowerCase(),
       approvedDocumentId: (data) => (data.Approved_Document_vod__c ? data.Approved_Document_vod__c.ID : null),
       //Veeva returns { value: label }
@@ -582,6 +585,7 @@ const crm = {
     vault: {
       id: "vault",
       idField: "id",
+      httpThroughLibrary: true, //the CLM web view blocks fetch / XHR to other hosts (images still load)
       normalizeKey: (value) => String(value).replace(/__(v|c|sys)$/, "").replace(/_/g, "").toLowerCase(),
       approvedDocumentId: (data) => (data.approved_document__v ? data.approved_document__v.id : null),
       //Vault returns [{ name, label, isActive }]
@@ -990,6 +994,80 @@ const crm = {
         }
       });
     },
+
+    //true when HTTP requests go through the library's request (driver says so and the library is loaded)
+    useLibraryRequest: () => {
+      let library = crm.helpers.library();
+      return !!(crm.helpers.driver().httpThroughLibrary && library && typeof library.request === "function");
+    },
+
+    requestResult: (pSuccess, pStatus, pHeaders, pBody, pMessage, pTimedOut) => ({
+      success: pSuccess,
+      status: pStatus,
+      headers: pHeaders || {},
+      body: pBody == null ? "" : String(pBody),
+      message: pMessage || null,
+      timedOut: !!pTimedOut,
+    }),
+
+    requestFetch: (pRequest, pTimeout) => {
+      let controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+      let timer = controller ? setTimeout(() => controller.abort(), pTimeout) : null;
+      let options = { method: pRequest.method || "GET", headers: pRequest.headers || {} };
+      if (pRequest.body != null && pRequest.body !== "") options.body = pRequest.body;
+      if (controller) options.signal = controller.signal;
+      return fetch(pRequest.url, options)
+        .then((response) =>
+          response.text().then((text) => {
+            let headers = {};
+            response.headers.forEach((value, key) => (headers[key] = value));
+            return crm.helpers.requestResult(response.ok, response.status, headers, text, response.ok ? null : `HTTP ${response.status}`, false);
+          }),
+        )
+        .catch((err) => crm.helpers.requestResult(false, 0, null, "", `crm.request: ${err}`, !!err && err.name === "AbortError"))
+        .finally(() => clearTimeout(timer));
+    },
+
+    //The app drops a request whose text contains "(" or ")" (no callback, observed on Vault CRM 261.3): they are
+    //escaped in JSON bodies (( ), same value once parsed) and in the url (%28 %29); other bodies or
+    //headers with one are refused
+    requestLibrary: (pRequest, pTimeout) => {
+      let headers = pRequest.headers || {};
+      let body = pRequest.body == null ? "" : String(pRequest.body);
+      let isJson = Object.keys(headers).some((key) => key.toLowerCase() === "content-type" && /json/i.test(headers[key]));
+      if (isJson) body = body.replace(/\(/g, "\\u0028").replace(/\)/g, "\\u0029");
+      let url = String(pRequest.url).replace(/\(/g, "%28").replace(/\)/g, "%29");
+      let parens = /[()]/;
+      if (parens.test(body) || Object.keys(headers).some((key) => parens.test(key) || parens.test(headers[key]))) {
+        let message = `crm.request: "(" or ")" in a non-JSON body or a header can't be sent through the CRM library (${url})`;
+        util.log(message, "error");
+        return Promise.resolve(crm.helpers.requestResult(false, 0, null, "", message, false));
+      }
+      let request = { url: url, method: pRequest.method || "GET", headers: headers, body: body, timeout: Math.ceil(pTimeout / 1000) };
+      return new Promise((resolve) => {
+        //the library times out on its own; this one only guards against a callback that never comes
+        let timer = setTimeout(() => resolve(crm.helpers.requestResult(false, 0, null, "", `crm.request: no response after ${pTimeout} ms`, true)), pTimeout + 2000);
+        try {
+          crm.helpers.library().request(request, (result) => {
+            clearTimeout(timer);
+            let data = result && result.data;
+            if (!data) {
+              //network error / timeout: { success: false, message: "request: ...NSURLErrorDomain Code=-1001..." }
+              let message = (result && result.message) || "crm.request: empty result";
+              resolve(crm.helpers.requestResult(false, 0, null, "", message, /Code=-1001\b|timed out/i.test(message)));
+              return;
+            }
+            //any HTTP status comes back in data; the library's success is false for non-2xx
+            let status = Number(data.statusCode) || 0;
+            let ok = status >= 200 && status < 300;
+            resolve(crm.helpers.requestResult(ok, status, data.headers, data.body, ok ? null : `HTTP ${status}`, false));
+          });
+        } catch (err) {
+          clearTimeout(timer);
+          resolve(crm.helpers.requestResult(false, 0, null, "", `crm.request: request threw ${err}`, false));
+        }
+      });
+    },
   },
 
   /* API --------------------------------------------------*/
@@ -1112,6 +1190,24 @@ const crm = {
     }
     this.state.labelCache[cacheKey] = labels;
     return labels;
+  },
+
+  /* HTTP (external services, e.g. the AI worker) --------*/
+  //request({ url, method, headers, body, timeout }) -> { success, status, headers, body, message, timedOut }
+  //success: 2xx; status 0 when no response (network error, timeout); body as text; timeout in ms.
+  //Through the library's request where the driver says so (Vault CRM), one at a time (the library keeps one
+  //global callback); through fetch elsewhere (Veeva CRM, browser mode)
+  request: function (pRequest) {
+    let timeout = pRequest.timeout || this.constants.requestTimeout;
+    if (!this.helpers.useLibraryRequest()) return this.helpers.requestFetch(pRequest, timeout);
+    let next = this.state.requestQueue.then(() => this.helpers.requestLibrary(pRequest, timeout));
+    this.state.requestQueue = next.catch(() => {});
+    return next;
+  },
+
+  //false when responses arrive in one piece (library request): no live streaming
+  canStream: function () {
+    return !this.helpers.useLibraryRequest();
   },
 
   /* NAVIGATION (same library calls on both platforms) ---*/
@@ -6119,6 +6215,8 @@ const ai = {
   TYPEWRITER_SPEED_MS: 10,
   MAX_DESCRIPTION_LENGTH: 200,
   REQUEST_TIMEOUT_MS: 15000,
+  //non-streaming chat waits for the whole answer, not the first byte (Vault CRM: 12.7 s for a short answer)
+  NON_STREAMING_TIMEOUT_MS: 60000,
 
   /*flow intent threshold ---------------------------------*/
   flowIntentThreshold: 40,
@@ -6384,14 +6482,10 @@ const ai = {
           context_data: ai.context,
         };
 
-        fetch(url, {
-          method: "POST",
-          headers: headers,
-          body: JSON.stringify(payload),
-        })
-          .then(function (response) {
-            if (!response.ok) {
-              throw new Error("HTTP " + response.status);
+        crm.request({ url: url, method: "POST", headers: headers, body: JSON.stringify(payload), timeout: ai.REQUEST_TIMEOUT_MS })
+          .then(function (result) {
+            if (!result.success) {
+              throw new Error(result.message);
             }
             // Context confirmed by server — no need to re-send it with the next question
             ai.state.contextWasRefreshed = false;
@@ -6482,8 +6576,8 @@ const ai = {
         // Reset the flag after checking it
         ai.state.contextWasRefreshed = false;
 
-        // Determine endpoint
-        const streaming = config.streaming !== false; // default to true
+        // Determine endpoint (no streaming where responses arrive in one piece: Vault CRM)
+        const streaming = config.streaming !== false && crm.canStream(); // default to true
         const endpoint = streaming ? "/v2/chat/stream" : "/v2/chat";
         const url = config.cloudflare.baseUrl + endpoint;
 
@@ -6693,23 +6787,19 @@ const ai = {
         const ui = ai.ui;
         const labels = clm.vars.ai.labels;
 
-        const controller = new AbortController();
-        const timeoutId = setTimeout(function () { controller.abort(); }, ai.REQUEST_TIMEOUT_MS);
-
-        fetch(url, {
-          method: "POST",
-          headers: headers,
-          body: JSON.stringify(payload),
-          signal: controller.signal,
-        })
-          .then(function (response) {
-            clearTimeout(timeoutId);
-            if (!response.ok) {
-              throw new Error("HTTP " + response.status);
+        crm.request({ url: url, method: "POST", headers: headers, body: JSON.stringify(payload), timeout: ai.NON_STREAMING_TIMEOUT_MS })
+          .then(function (result) {
+            if (result.timedOut) {
+              const timeoutError = new Error("Request timed out");
+              timeoutError.name = "AbortError";
+              throw timeoutError;
             }
-            
+            if (!result.success) {
+              throw new Error(result.message);
+            }
+
             ui.chat.updateStatus(labels.analizingData);
-            return response.json();
+            return JSON.parse(result.body);
           })
           .then(function (data) {
             // Validate response has content
@@ -6728,7 +6818,6 @@ const ai = {
             }
           })
           .catch(function (error) {
-            clearTimeout(timeoutId);
             const isTimeout = error.name === "AbortError";
             util.log("ai.api.conversation.sendQuestionNonStreaming(): " + (isTimeout ? "Request timed out" : "Network error: " + error), "error");
             ui.chat.updateStatus(isTimeout ? labels.requestTimeout : labels.errorSendingQuestion);
@@ -6793,20 +6882,15 @@ const ai = {
           "x-idc-secret": config.cloudflare.apiKey,
         };
 
-        fetch(url, {
-          method: "DELETE",
-          headers: headers,
-        })
-          .then(function (response) {
-            if (response.ok) {
-              util.log("AI Conversation cleared successfully on server", "info");
-            } else {
-              util.log("ai.api.conversation.clearConversation(): Server returned error: HTTP " + response.status, "warn");
-            }
-          })
-          .catch(function (error) {
-            util.log("ai.api.conversation.clearConversation(): Network error: " + error, "error");
-          });
+        crm.request({ url: url, method: "DELETE", headers: headers, timeout: ai.REQUEST_TIMEOUT_MS }).then(function (result) {
+          if (result.success) {
+            util.log("AI Conversation cleared successfully on server", "info");
+          } else if (result.status) {
+            util.log("ai.api.conversation.clearConversation(): Server returned error: HTTP " + result.status, "warn");
+          } else {
+            util.log("ai.api.conversation.clearConversation(): Network error: " + result.message, "error");
+          }
+        });
 
         // Clear local state immediately (don't wait for server confirmation)
         // New conversation will be created on next question if needed

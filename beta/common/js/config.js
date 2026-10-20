@@ -889,7 +889,7 @@ let com_idc_params = {
       "chatPosition": { "left": 100, "top": 200 },
       "smartNextFlowPosition": { "left": 720, "top": 240 },
       "cloudflare": {
-        "baseUrl": "https://idc-ai-worker.marcos-a-casanueva.workers.dev",
+        "baseUrl": "https://kona-ai.dev",
         "apiKey": "re6qQeuoPFJVLPQYv3kUGYohTYFMBDgYYpcbAKLcT8MACYKaLjsEiF"
       },
     },
