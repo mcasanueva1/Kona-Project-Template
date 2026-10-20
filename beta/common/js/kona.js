@@ -1,6 +1,6 @@
 "use strict";
 
-const BUILD_ID = "kona library __20261015-201703-yhqt6w2__";
+const BUILD_ID = "kona library __20261020-145018-rj0htnc__";
 console.log("%cBuild:", "color:#888", BUILD_ID);
 
 (function (global) {
@@ -832,14 +832,109 @@ const crm = {
     },
 
     //conditions: [clause, ...] ANDed; clause: { field, op, value } (value array = any of) or { or: [clauses] }
-    renderWhere: (pObject, pConditions) => {
+    //pOptions.quiet: no error log when the clause is over maxWhereLength (measuring before a split)
+    renderWhere: (pObject, pConditions, pOptions) => {
       if (!pConditions || !pConditions.length) return null;
       let objectDef = crm.helpers.objectDef(pObject);
       let where = "WHERE " + pConditions.map((c) => crm.helpers.renderClause(objectDef, pObject, c)).join(" AND ");
-      if (where.length > crm.constants.maxWhereLength) {
+      if (where.length > crm.constants.maxWhereLength && !(pOptions && pOptions.quiet)) {
         util.log(`crm.query: where clause for ${pObject} is ${where.length} characters (limit about ${crm.constants.maxWhereLength})`, "error");
       }
       return where;
+    },
+
+    //where clause over maxWhereLength -> { length, parts: [conditions, ...] }, each part fitting the limit.
+    //The array condition with the longest rendered clause is chunked; or groups are never split.
+    //null when the clause fits, or when it cannot be split (no array condition, or one value alone is already too long)
+    splitConditions: (pObject, pConditions) => {
+      let max = crm.constants.maxWhereLength;
+      let where = crm.helpers.renderWhere(pObject, pConditions, { quiet: true });
+      if (!where || where.length <= max) return null;
+      let objectDef = crm.helpers.objectDef(pObject);
+      let index = -1;
+      let longest = 0;
+      pConditions.forEach((c, k) => {
+        if (c.or || !Array.isArray(c.value) || c.value.length < 2) return;
+        let length = crm.helpers.renderClause(objectDef, pObject, c).length;
+        if (length > longest) {
+          longest = length;
+          index = k;
+        }
+      });
+      if (index === -1) return null;
+      let condition = pConditions[index];
+      let fixed = where.length - longest;
+      let pieces = condition.value.map((v) => crm.helpers.renderClause(objectDef, pObject, Object.assign({}, condition, { value: v })).length);
+      if (pieces.some((p) => fixed + p > max)) return null;
+      //greedy packing: one value renders as "piece", several as "(piece OR piece ...)"
+      let chunks = [];
+      let chunk = [];
+      let sum = 0;
+      condition.value.forEach((v, k) => {
+        let n = chunk.length + 1;
+        let length = n === 1 ? fixed + pieces[k] : fixed + 2 + sum + pieces[k] + 4 * (n - 1);
+        if (length > max) {
+          chunks.push(chunk);
+          chunk = [];
+          sum = 0;
+        }
+        chunk.push(v);
+        sum += pieces[k];
+      });
+      chunks.push(chunk);
+      let parts = chunks.map((values) => {
+        let conditions = pConditions.slice();
+        conditions[index] = Object.assign({}, condition, { value: values });
+        return conditions;
+      });
+      return { length: where.length, parts: parts };
+    },
+
+    //sorts the merged results of a split query by neutral values: numbers numerically, the rest as text,
+    //empty values first for ASC (last for DESC), stable. Records stay as they are when a sort field was not queried
+    sortRecords: (pObject, pRecords, pSort, pFields) => {
+      let missing = pSort.filter((s) => pFields.indexOf(s.field) === -1);
+      if (missing.length) {
+        crm.helpers.logOnce(`crm.query: ${pObject} split into several queries, sort field "${missing[0].field}" not queried: sorted per query only`);
+        return pRecords;
+      }
+      let empty = (v) => v == null || v === "";
+      let compare = (a, b) => {
+        if (empty(a)) return empty(b) ? 0 : -1;
+        if (empty(b)) return 1;
+        if (typeof a === "number" && typeof b === "number") return a - b;
+        a = String(a);
+        b = String(b);
+        return a < b ? -1 : a > b ? 1 : 0;
+      };
+      return pRecords
+        .map((record, i) => ({ record: record, i: i }))
+        .sort((x, y) => {
+          for (let s of pSort) {
+            let d = compare(x.record[s.field], y.record[s.field]);
+            if (d) return s.dir === "DESC" ? -d : d;
+          }
+          return x.i - y.i;
+        })
+        .map((x) => x.record);
+    },
+
+    //one queryRecord call, records mapped to neutral names (crm.query splits long where clauses before this)
+    queryOnce: async (pObject, pFields, pConditions, pSort, pLimit) => {
+      let objectDef = crm.helpers.objectDef(pObject);
+      let platformFields = pFields.map((f) => crm.helpers.fieldDef(objectDef, pObject, f).name);
+      let where = crm.helpers.renderWhere(pObject, pConditions);
+      let sort = crm.helpers.renderSort(pObject, pSort);
+      let data = await crm.helpers.call("queryRecord", [objectDef.name, platformFields, where, sort, pLimit == null ? null : pLimit]);
+      if (!data.success) {
+        util.log(`crm.query: ${pObject} failed: ${data.message}`, "error");
+        return { success: false, records: [], message: data.message };
+      }
+      let records = [];
+      for (let record of data[objectDef.name] || []) {
+        records.push(await crm.helpers.toNeutralRecord(pObject, pFields, record));
+      }
+      return { success: true, records: records, message: null };
     },
 
     //sort: [{ field, dir }]
@@ -926,20 +1021,20 @@ const crm = {
   },
 
   //query("call", ["id", "status"], [{ field: "status", value: ["submitted", "planned"] }], [{ field: "datetime", dir: "DESC" }])
+  //A where clause over maxWhereLength is split into several queries on its longest array condition; the records
+  //are merged, then sorted and limited again, so callers can pass id lists of any size
   query: async function (pObject, pFields, pConditions, pSort, pLimit) {
-    let objectDef = this.helpers.objectDef(pObject);
-    let platformFields = pFields.map((f) => this.helpers.fieldDef(objectDef, pObject, f).name);
-    let where = this.helpers.renderWhere(pObject, pConditions);
-    let sort = this.helpers.renderSort(pObject, pSort);
-    let data = await this.helpers.call("queryRecord", [objectDef.name, platformFields, where, sort, pLimit == null ? null : pLimit]);
-    if (!data.success) {
-      util.log(`crm.query: ${pObject} failed: ${data.message}`, "error");
-      return { success: false, records: [], message: data.message };
-    }
+    let split = this.helpers.splitConditions(pObject, pConditions);
+    if (!split) return this.helpers.queryOnce(pObject, pFields, pConditions, pSort, pLimit);
     let records = [];
-    for (let record of data[objectDef.name] || []) {
-      records.push(await this.helpers.toNeutralRecord(pObject, pFields, record));
+    for (let conditions of split.parts) {
+      let part = await this.helpers.queryOnce(pObject, pFields, conditions, pSort, pLimit);
+      if (!part.success) return part;
+      records = records.concat(part.records);
     }
+    util.log(`crm.query: ${pObject} split into ${split.parts.length} queries (where clause ${split.length} characters, limit about ${this.constants.maxWhereLength})`);
+    if (pSort && pSort.length) records = this.helpers.sortRecords(pObject, records, pSort, pFields);
+    if (pLimit != null) records = records.slice(0, pLimit);
     return { success: true, records: records, message: null };
   },
 
@@ -9610,7 +9705,7 @@ const interactionSummary = {
                     if (!result.success) util.log(`interactionSummary.api.generateDataModel: failed to retrieve call key message records ${result.message}`, "error");
                     callKeyMessageRecords = result.records;
                   } else {
-                    //filter by key message IDs: batch queries to respect ~1000-char WHERE clause limit
+                    //filter by key message IDs (crm.query also splits a where clause over its ~1000-char limit)
                     const kmIdBatches = util.chunkArray([...new Set(keyMessagesMatrix.map((item) => item.id))], 15);
                     for (const kmIdBatch of kmIdBatches) {
                       let result = await crm.query("callKeyMessage", fields.callKeyMessage, accountCondition.concat([{ field: "keyMessageId", value: kmIdBatch }]));
@@ -9975,6 +10070,7 @@ const interactionSummary = {
               } else {
                 accountsToProcess = vars.metadata.allAccounts;
               }
+              output.allAccounts = []; //a rebuild starts empty: records from a previous run lack the keys removed below for accounts with no activity
 
               //store names for slides, emails and related CLM
               {
