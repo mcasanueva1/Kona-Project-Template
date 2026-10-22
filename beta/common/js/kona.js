@@ -1,6 +1,6 @@
 "use strict";
 
-const BUILD_ID = "kona library __20261020-211148-t63hit5__";
+const BUILD_ID = "kona library __20261022-121532-cgen6zu__";
 console.log("%cBuild:", "color:#888", BUILD_ID);
 
 (function (global) {
@@ -5568,8 +5568,17 @@ const smartNext = {
         // Broadcast flows are already in vault-ID format from the originating presentation.
         // Use items as-is — do NOT re-normalize against this presentation's slide config,
         // which would incorrectly remap items to local slides sharing the same slide ID.
-        // Items without a keyMessage cannot be addressed from another presentation: skipped.
-        vaultItems = items.filter(function (i) { return i && i.keyMessage; });
+        // Items without a keyMessage (configs with no Vault ids) are addressable only inside the presentation
+        // that created them, by slideId: same presentation id, or the same project name when there is no id,
+        // so another id-less presentation's slides are never mapped onto local slides sharing an id.
+        const thisPres = (clm.vars.project && clm.vars.project.vaultExternalID && clm.vars.project.vaultExternalID.presentation) || null;
+        const thisName = (clm.vars.project && clm.vars.project.name) || null;
+        vaultItems = items.filter(function (i) {
+          if (!i) return false;
+          if (i.keyMessage) return true;
+          if (!i.slideId || (i.presentation || null) !== thisPres) return false;
+          return thisPres ? true : (i.presentationName || null) === thisName;
+        });
       } else if (typeof customFlows !== "undefined" && customFlows.api && customFlows.api.getItemVaultIds) {
         vaultItems = items.map(function (i) { return customFlows.api.getItemVaultIds(i); }).filter(function (v) { return v !== null; });
       } else {
@@ -16312,7 +16321,10 @@ const customFlows = {
      * Where should Fix put v.slideId? Try every position, keep those that resolve v
      * without introducing a violation that was not already there, and pick the one
      * that (1) leaves the fewest violations, (2) is closest to the natural position,
-     * (3) is lowest. If none is clean, fall back to the natural position.
+     * (3) is lowest. If no position is clean, search again allowing the slides that
+     * v.slideId's own rules require (they come with the slide wherever it goes), so
+     * every rule asking for the same missing slide still agrees on one position.
+     * If none is found, fall back to the natural position.
      */
     resolveFixPosition: function(v, slideIds, rules, baseline) {
       baseline = baseline || this.evaluate(slideIds, rules);
@@ -16320,15 +16332,23 @@ const customFlows = {
       const key = this.violationKey(v);
       const isPresent = slideIds.indexOf(v.slideId) !== -1;
       const max = isPresent ? slideIds.length - 1 : slideIds.length;
-      let best = null;
+      // a slide v.slideId's own rule requires (missing-before / missing-with raised by v.slideId)
+      const ownRequirement = x => x.relatedSlideId === v.slideId && (x.kind === 'missing-before' || x.kind === 'missing-with');
 
-      for (let pos = 0; pos <= max; pos++) {
-        const keys = this.evaluate(this.simulate(slideIds, v, pos), rules).map(x => this.violationKey(x));
-        if (keys.indexOf(key) !== -1) continue;                     // still violated
-        if (keys.some(k => baseKeys.indexOf(k) === -1)) continue;   // introduces a new violation
-        const score = [keys.length, Math.abs(pos - v.naturalPosition), pos];
-        if (!best || this._lexLess(score, best.score)) best = { pos: pos, score: score };
-      }
+      const search = tolerateOwnRequirements => {
+        let best = null;
+        for (let pos = 0; pos <= max; pos++) {
+          const after = this.evaluate(this.simulate(slideIds, v, pos), rules);
+          const keys = after.map(x => this.violationKey(x));
+          if (keys.indexOf(key) !== -1) continue;                   // still violated
+          if (after.some(x => baseKeys.indexOf(this.violationKey(x)) === -1 &&
+            !(tolerateOwnRequirements && ownRequirement(x)))) continue; // introduces a new violation
+          const score = [keys.length, Math.abs(pos - v.naturalPosition), pos];
+          if (!best || this._lexLess(score, best.score)) best = { pos: pos, score: score };
+        }
+        return best;
+      };
+      const best = search(false) || search(true);
 
       return best
         ? { targetPosition: best.pos, fallback: false }
